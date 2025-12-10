@@ -1,6 +1,0 @@
-# Top 2 rainiest days (metric: max_hourly)
-# Generated: 2025-10-31 11:00:48
-# Format: YYYY-MM-DD
-#
-2024-04-01
-2025-02-07

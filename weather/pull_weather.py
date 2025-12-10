@@ -90,7 +90,7 @@ def get_hourly_rainfall_intensity(start_date=None, end_date=None):
     session = create_session(engine)
     
     # Find rainfall datastream(s)
-    rain_ds = session.query(DendraDatastream).filter(DendraDatastream.name == "Rainfall").all()
+    rain_ds = session.query(DendraDatastream).filter(DendraDatastream.name.in_(["Rainfall", "Rainfall Sum"])).all()
     rain_ds_ids = [ds.id for ds in rain_ds]
     print(f"Found {len(rain_ds_ids)} rainfall datastream(s)")
     
@@ -133,7 +133,7 @@ def get_hourly_rainfall_intensity(start_date=None, end_date=None):
 
 
 def rank_days_by_rainfall_intensity(top_n=None, min_rainfall=0.5, start_date=None, end_date=None, 
-                                     metric='max_hourly'):
+                                     metric='max_hourly', max_valid_rainfall=None):
     """
     Rank days by rainfall intensity and return the top N rainiest days
     
@@ -151,6 +151,9 @@ def rank_days_by_rainfall_intensity(top_n=None, min_rainfall=0.5, start_date=Non
         - 'mean_hourly': Mean hourly rainfall rate (when rain > 0)
         - 'daily_total': Total daily rainfall
         - 'peak_intensity': Average of station peak hourly rates
+        - 'rain_hours': Number of station-hours with rain above threshold
+    max_valid_rainfall : float, optional
+        Filter out readings above this value (sensor errors)
     
     Returns:
     --------
@@ -169,6 +172,14 @@ def rank_days_by_rainfall_intensity(top_n=None, min_rainfall=0.5, start_date=Non
     
     if len(hourly) == 0:
         return [], pd.DataFrame()
+    
+    # Filter out extreme values (sensor errors) if specified
+    if max_valid_rainfall is not None:
+        before_count = len(hourly)
+        hourly = hourly[hourly['hourly_rain_mm'] <= max_valid_rainfall]
+        after_count = len(hourly)
+        if before_count > after_count:
+            print(f"⚠️  Filtered out {before_count - after_count} extreme readings (>{max_valid_rainfall} mm/hr)")
     
     # Add date column
     hourly['date'] = hourly['timestamp_utc'].dt.date
@@ -209,6 +220,21 @@ def rank_days_by_rainfall_intensity(top_n=None, min_rainfall=0.5, start_date=Non
         daily_stats.columns = ['date', 'avg_station_peak', 'max_station_peak', 'sum_peaks', 'n_stations']
         daily_stats = daily_stats.sort_values('avg_station_peak', ascending=False)
     
+    elif metric == 'rain_hours':
+        # Count station-hours with rain above threshold (widespread, consistent rain)
+        # This finds days with lots of rain coverage, not just spikes
+        rain_threshold = min_rainfall  # Use min_rainfall as the threshold
+        hourly_with_rain = hourly[hourly['hourly_rain_mm'] >= rain_threshold]
+        
+        # Count rain-hours per day
+        daily_rain_hours = hourly_with_rain.groupby('date').agg({
+            'hourly_rain_mm': ['count', 'sum', 'mean', 'max'],
+            'datastream_id': 'nunique'
+        }).reset_index()
+        daily_rain_hours.columns = ['date', 'rain_hours', 'total_rain', 'mean_rain_rate', 'max_rain_rate', 'n_stations']
+        daily_rain_hours = daily_rain_hours.sort_values('rain_hours', ascending=False)
+        daily_stats = daily_rain_hours
+    
     else:
         raise ValueError(f"Unknown metric: {metric}")
     
@@ -233,6 +259,8 @@ def rank_days_by_rainfall_intensity(top_n=None, min_rainfall=0.5, start_date=Non
             print(f"  {date_str}: {row['total_rain']:.1f} mm total, {row['max_hourly']:.1f} mm/hr peak")
         elif metric == 'peak_intensity':
             print(f"  {date_str}: {row['avg_station_peak']:.1f} mm/hr (avg peak), {row['n_stations']:.0f} stations")
+        elif metric == 'rain_hours':
+            print(f"  {date_str}: {row['rain_hours']:.0f} rain-hours, {row['total_rain']:.1f} mm total, {row['max_rain_rate']:.1f} mm/hr peak")
     
     if len(top_days) > 10:
         print(f"  ... and {len(top_days) - 10} more days")
@@ -241,17 +269,238 @@ def rank_days_by_rainfall_intensity(top_n=None, min_rainfall=0.5, start_date=Non
     
     return top_days, daily_stats
 
-def create_rainy_days_dict(top_days):
-
+def get_10min_gauge_data(start_date=None, end_date=None, stations=None):
+    """
+    Get 10-minute interval rain gauge data for alignment with NEXRAD
+    
+    Parameters:
+    -----------
+    start_date : datetime.date or str
+        Start date for data extraction
+    end_date : datetime.date or str
+        End date for data extraction
+    stations : list of int, optional
+        List of station IDs to include (default: all rainfall stations)
+    
+    Returns:
+    --------
+    df : pandas.DataFrame
+        Columns: timestamp_utc, station_id, station_name, lat, lon, rainfall_mm
+        Index: timestamp_utc
+    """
+    from datetime import datetime, timedelta
+    
+    # Convert string dates if needed
+    if isinstance(start_date, str):
+        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+    if isinstance(end_date, str):
+        end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+    
     engine = connect()
     session = create_session(engine)
-    rainy_days_dict = {}
+    
+    # Find rainfall datastreams
+    rain_ds_query = session.query(DendraDatastream).filter(
+        DendraDatastream.name == "Rainfall"
+    )
+    
+    if stations:
+        rain_ds_query = rain_ds_query.filter(DendraDatastream.station_id.in_(stations))
+    
+    rain_ds = rain_ds_query.all()
+    rain_ds_ids = [ds.id for ds in rain_ds]
+    
+    print(f"Found {len(rain_ds_ids)} rainfall datastream(s)")
+    
+    # Get station metadata for lat/lon
+    station_info = {}
+    for ds in rain_ds:
+        station = session.query(DendraStation).filter(
+            DendraStation.id == ds.station_id
+        ).first()
+        if station:
+            station_info[ds.id] = {
+                'station_id': station.id,
+                'name': station.name,
+                'lat': station.latitude,
+                'lon': station.longitude
+            }
+    
+    # Query rainfall datapoints
+    query = session.query(
+        DendraDatapoint.timestamp_utc,
+        DendraDatapoint.datastream_id,
+        DendraDatapoint.value
+    ).filter(DendraDatapoint.datastream_id.in_(rain_ds_ids))
+    
+    if start_date:
+        start_datetime = datetime.combine(start_date, datetime.min.time())
+        query = query.filter(DendraDatapoint.timestamp_utc >= start_datetime)
+    if end_date:
+        end_datetime = datetime.combine(end_date, datetime.min.time()) + timedelta(days=1)
+        query = query.filter(DendraDatapoint.timestamp_utc < end_datetime)
+    
+    query = query.order_by(DendraDatapoint.timestamp_utc)
+    
+    print(f"Querying 10-minute gauge data from {start_date} to {end_date}...")
+    results = query.all()
+    print(f"Found {len(results)} rainfall measurements")
+    
+    if len(results) == 0:
+        return pd.DataFrame()
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(results, columns=['timestamp_utc', 'datastream_id', 'rainfall_mm'])
+    
+    # Add station metadata
+    df['station_id'] = df['datastream_id'].map(lambda x: station_info.get(x, {}).get('station_id'))
+    df['station_name'] = df['datastream_id'].map(lambda x: station_info.get(x, {}).get('name'))
+    df['lat'] = df['datastream_id'].map(lambda x: station_info.get(x, {}).get('lat'))
+    df['lon'] = df['datastream_id'].map(lambda x: station_info.get(x, {}).get('lon'))
+    
+    # Round timestamps to nearest 10 minutes for consistency
+    df['timestamp_10min'] = df['timestamp_utc'].dt.round('10min')
+    
+    # Group by station and 10-min interval (in case of duplicates)
+    df_grouped = df.groupby(['timestamp_10min', 'station_id']).agg({
+        'rainfall_mm': 'sum',
+        'station_name': 'first',
+        'lat': 'first',
+        'lon': 'first'
+    }).reset_index()
+    
+    df_grouped.rename(columns={'timestamp_10min': 'timestamp_utc'}, inplace=True)
+    
+    print(f"Aggregated to {len(df_grouped)} 10-minute measurements across {df_grouped['station_id'].nunique()} stations")
+    
+    return df_grouped
 
-    for day in top_days:
-        query = session.query(DendraDatapoint).filter(DendraDatapoint.timestamp_utc.date() == day).filter(DendraDatapoint.datastream_id.in_(rain_ds_ids)).all()
+
+def get_hourly_precipitation_by_station(start_date=None, end_date=None, min_rainfall_mm=0.1):
+    """
+    Get hourly accumulated precipitation for each station (for ML training)
+    
+    Parameters:
+    -----------
+    start_date, end_date : datetime.date or str
+        Date range
+    min_rainfall_mm : float
+        Minimum hourly rainfall to include (default: 0.1mm)
+        Use to filter out very light/trace amounts
+    
+    Returns:
+    --------
+    samples : list of dict
+        Each dict contains:
+        {
+            'hour_start': datetime,
+            'station_id': int,
+            'station_name': str,
+            'lat': float,
+            'lon': float,
+            'hourly_precip_mm': float
+        }
+    """
+    from datetime import datetime, timedelta
+    
+    # Convert string dates if needed
+    if isinstance(start_date, str):
+        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+    if isinstance(end_date, str):
+        end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+    
+    engine = connect()
+    session = create_session(engine)
+    
+    # Find rainfall datastreams
+    rain_ds = session.query(DendraDatastream).filter(DendraDatastream.name.in_(["Rainfall", "Rainfall Sum"])).all()
+    rain_ds_ids = [ds.id for ds in rain_ds]
+    
+    print(f"Found {len(rain_ds_ids)} rainfall datastream(s)")
+    
+    # Get station metadata
+    station_info = {}
+    for ds in rain_ds:
+        station = session.query(DendraStation).filter(
+            DendraStation.id == ds.station_id
+        ).first()
+        if station:
+            station_info[ds.id] = {
+                'station_id': station.id,
+                'name': station.name,
+                'lat': station.latitude,
+                'lon': station.longitude
+            }
+    
+    # Query rainfall datapoints
+    query = session.query(
+        DendraDatapoint.timestamp_utc,
+        DendraDatapoint.datastream_id,
+        DendraDatapoint.value
+    ).filter(DendraDatapoint.datastream_id.in_(rain_ds_ids))
+    
+    if start_date:
+        start_datetime = datetime.combine(start_date, datetime.min.time())
+        query = query.filter(DendraDatapoint.timestamp_utc >= start_datetime)
+    if end_date:
+        end_datetime = datetime.combine(end_date, datetime.min.time()) + timedelta(days=1)
+        query = query.filter(DendraDatapoint.timestamp_utc < end_datetime)
+    
+    query = query.order_by(DendraDatapoint.timestamp_utc)
+    
+    print(f"Querying precipitation data from {start_date} to {end_date}...")
+    results = query.all()
+    print(f"Found {len(results)} measurements")
+    
+    if len(results) == 0:
+        return []
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(results, columns=['timestamp_utc', 'datastream_id', 'rainfall_mm'])
+    
+    # Add station metadata
+    df['station_id'] = df['datastream_id'].map(lambda x: station_info.get(x, {}).get('station_id'))
+    df['station_name'] = df['datastream_id'].map(lambda x: station_info.get(x, {}).get('name'))
+    df['lat'] = df['datastream_id'].map(lambda x: station_info.get(x, {}).get('lat'))
+    df['lon'] = df['datastream_id'].map(lambda x: station_info.get(x, {}).get('lon'))
+    
+    # Group by hour and station
+    df['hour'] = df['timestamp_utc'].dt.floor('H')
+    
+    hourly = df.groupby(['hour', 'station_id']).agg({
+        'rainfall_mm': 'sum',
+        'station_name': 'first',
+        'lat': 'first',
+        'lon': 'first'
+    }).reset_index()
+    
+    # Filter by minimum rainfall
+    hourly = hourly[hourly['rainfall_mm'] >= min_rainfall_mm]
+    
+    # Convert to list of dicts
+    samples = []
+    for _, row in hourly.iterrows():
+        samples.append({
+            'hour_start': row['hour'],
+            'station_id': row['station_id'],
+            'station_name': row['station_name'],
+            'lat': row['lat'],
+            'lon': row['lon'],
+            'hourly_precip_mm': row['rainfall_mm']
+        })
+    
+    print(f"\nFound {len(samples)} hourly samples with rainfall >= {min_rainfall_mm}mm")
+    print(f"  Covering {len(set(s['station_id'] for s in samples))} stations")
+    if len(samples) > 0:
+        print(f"  Time range: {min(s['hour_start'] for s in samples)} to {max(s['hour_start'] for s in samples)}")
+        print(f"  Precipitation range: {min(s['hourly_precip_mm'] for s in samples):.2f} - {max(s['hourly_precip_mm'] for s in samples):.2f} mm/hr")
+    
+    return samples
 
 
-
+# def create_rainy_days_dict(top_days):
+#     """Incomplete function - not currently used"""
+#     pass
 
 
 def save_rainy_days_list(filename='rainy_days_ranked.txt', top_n=100, min_rainfall=None,

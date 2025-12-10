@@ -3,6 +3,7 @@ from sqlalchemy import create_engine
 
 # load environmental variables
 load_dotenv()
+print(dotenv_values())
 
 # establish connection to PostGIS database
 def connect(): 

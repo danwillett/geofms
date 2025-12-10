@@ -1,5 +1,5 @@
 # Requirements:
-# pip install s3fs pyart xarray numpy tqdm pyproj
+# pip install s3fs pyart xarray numpy tqdm pyproj shapely
 
 import numpy as np
 import datetime as dt
@@ -10,6 +10,8 @@ from pyproj import Transformer, Geod
 from tqdm import tqdm
 import io
 
+import rasterio
+from shapely.geometry import box
 import cftime
 import re
 from datetime import datetime, timedelta
@@ -38,25 +40,18 @@ def pull_nexrad(day_filter=None, day_filter_file=None, apply_qc=True):
     """
     
     # ---------------- USER PARAMETERS ----------------
-    STATION = "KVBX"   # Vandenberg AFB
-    # Radar lat/lon (fill in from station metadata or lookup)
-    RADAR_LAT = 34.83855 
-    RADAR_LON = -120.397917
-
-    # Preserve bounding box (lon_min, lat_min, lon_max, lat_max) - replace with your values
-    PRESERVE_BBOX = (-120.5130681, 34.5775648, -120.3456914, 34.4344052)
+    STATION = "KVBX"
+    RADAR_LAT, RADAR_LON = 34.83855, -120.397917
+    RESOLUTION = 500.0  # radar horizontal spacing in meters (native resolution)
+    Z_MIN, Z_MAX, Z_RES = 0.0, 15000.0, 375.0
+    PRESERVE_BBOX = (-120.5130681, 34.5775648, -120.3456914, 34.4344052)  # study AOI (west, north, east, south)
+    PATCH_SIZE_M = 2640  # TerraMesh patch size in meters
+    UTM_CRS = "EPSG:32610"  # UTM Zone 10N for California coast
+    BUFFER_M = 5000  # Add 5km buffer around preserve
 
     START_DATE = dt.date(2022, 10, 1)
     END_DATE   = dt.date(2025, 5, 12)
 
-    # desired horizontal resolution (meters)
-    RESOLUTION = 500.0
-
-    # vertical grid settings (z in meters)
-    Z_MIN = 0.0
-    Z_MAX = 15000.0   # 15 km tops
-    Z_RES = 375.0     # vertical spacing (example)
-    
     # Threading settings
     MAX_WORKERS = 30  # Number of parallel downloads/processing threads
     FIELD = 'reflectivity'
@@ -66,64 +61,79 @@ def pull_nexrad(day_filter=None, day_filter_file=None, apply_qc=True):
     QC_FIELDS = ['reflectivity']  # Fields to apply QC mask to
     # -------------------------------------------------
     
+    print(f"\n📐 Resolution: {RESOLUTION}m (native radar resolution)")
+    print(f"   Patch size: {PATCH_SIZE_M}m → {int(PATCH_SIZE_M/RESOLUTION)}×{int(PATCH_SIZE_M/RESOLUTION)} pixels per patch")
+    
     if APPLY_QC:
         print("\n✅ Quality control ENABLED - will filter ground clutter & noise using RhoHV")
     else:
         print("\n⚠️  Quality control DISABLED - raw reflectivity will be used")
 
-    # Derived vertical shape
-    nz = int(np.ceil((Z_MAX - Z_MIN) / Z_RES))
 
-    # pyproj transforms: use Azimuthal Equidistant centered on the radar
-    aeqd = Transformer.from_crs(
-        f"+proj=aeqd +lat_0={RADAR_LAT} +lon_0={RADAR_LON} +units=m +datum=WGS84",
-        "epsg:3857", # intermediate, but we only use forward transform below via inverse usage; simpler to use transform directly
+    # Convert AOI from lat/lon to UTM coordinates
+    from pyproj import CRS
+    wgs84 = CRS.from_epsg(4326)
+    utm_crs = CRS.from_string(UTM_CRS)
+    transformer_to_utm = Transformer.from_crs(wgs84, utm_crs, always_xy=True)
+    
+    # PRESERVE_BBOX is (west, north, east, south) in lat/lon
+    west_utm, north_utm = transformer_to_utm.transform(PRESERVE_BBOX[0], PRESERVE_BBOX[1])
+    east_utm, south_utm = transformer_to_utm.transform(PRESERVE_BBOX[2], PRESERVE_BBOX[3])
+    
+    # Add buffer and align to PATCH_SIZE_M boundaries for clean patch extraction
+    xmin = np.floor((west_utm - BUFFER_M) / PATCH_SIZE_M) * PATCH_SIZE_M
+    xmax = np.ceil((east_utm + BUFFER_M) / PATCH_SIZE_M) * PATCH_SIZE_M
+    ymin = np.floor((south_utm - BUFFER_M) / PATCH_SIZE_M) * PATCH_SIZE_M
+    ymax = np.ceil((north_utm + BUFFER_M) / PATCH_SIZE_M) * PATCH_SIZE_M
+    
+    # Calculate grid dimensions
+    num_patches_x = int((xmax - xmin) / PATCH_SIZE_M)
+    num_patches_y = int((ymax - ymin) / PATCH_SIZE_M)
+    grid_width_m = xmax - xmin
+    grid_height_m = ymax - ymin
+    
+    print(f"\n{'='*60}")
+    print(f"Radar Grid Configuration:")
+    print(f"  Study area (lat/lon): {PRESERVE_BBOX}")
+    print(f"  Buffer: {BUFFER_M}m")
+    print(f"  Patch alignment: {PATCH_SIZE_M}m boundaries")
+    print(f"  ")
+    print(f"  UTM Bounding Box ({UTM_CRS}):")
+    print(f"    X: [{xmin:.0f}, {xmax:.0f}] meters ({num_patches_x} patches)")
+    print(f"    Y: [{ymin:.0f}, {ymax:.0f}] meters ({num_patches_y} patches)")
+    print(f"    Dimensions: {grid_width_m:.0f}m × {grid_height_m:.0f}m")
+    print(f"  ")
+    print(f"  Resolution: {RESOLUTION}m")
+    print(f"  Pixels per patch: {int(PATCH_SIZE_M/RESOLUTION)}×{int(PATCH_SIZE_M/RESOLUTION)}")
+    print(f"{'='*60}\n")
+
+    # Convert UTM bounds to radar-local azimuthal equidistant coordinates for PyART gridding
+    transformer = Transformer.from_crs(
+        utm_crs, 
+        f"+proj=aeqd +lat_0={RADAR_LAT} +lon_0={RADAR_LON} +units=m +datum=WGS84", 
         always_xy=True
     )
-    # Actually we want direct lon/lat -> local meters. Use Transformer with proj string forward:
-    transformer = Transformer.from_crs("EPSG:4326",
-                                    f"+proj=aeqd +lat_0={RADAR_LAT} +lon_0={RADAR_LON} +units=m +datum=WGS84",
-                                    always_xy=True)
+    xmin_m, ymin_m = transformer.transform(xmin, ymin)
+    xmax_m, ymax_m = transformer.transform(xmax, ymax)
 
-    def bbox_to_local_meters(bbox):
-        lon_min, lat_min, lon_max, lat_max = bbox
-        # get four corners (lon, lat) -> (x, y) in meters relative to radar center
-        x1, y1 = transformer.transform(lon_min, lat_min)
-        x2, y2 = transformer.transform(lon_max, lat_max)
-        # compute axis-aligned min/max
-        xmin, xmax = min(x1, x2), max(x1, x2)
-        ymin, ymax = min(y1, y2), max(y1, y2)
-        return xmin, xmax, ymin, ymax
-
-    # check distance from radar center to preserve centroid to ensure coverage
-    geod = Geod(ellps="WGS84")
-    lon_c = 0.5 * (PRESERVE_BBOX[0] + PRESERVE_BBOX[2])
-    lat_c = 0.5 * (PRESERVE_BBOX[1] + PRESERVE_BBOX[3])
-    az12, az21, dist_m = geod.inv(RADAR_LON, RADAR_LAT, lon_c, lat_c)  # meters
-
-    print(f"Distance radar -> preserve centroid: {dist_m/1000:.1f} km")
-
-    # reasonable NEXRAD range threshold (meters)
-    RANGE_THRESHOLD = 250_000.0
-    if dist_m > RANGE_THRESHOLD:
-        print("Warning: preserve centroid is >250 km from radar - limited or no coverage likely.")
-
-    # compute local bbox in meters and build grid limits
-    xmin, xmax, ymin, ymax = bbox_to_local_meters(PRESERVE_BBOX)
-    # expand a little buffer (optional)
-    buffer_m = 1000.0
-    xmin -= buffer_m; xmax += buffer_m; ymin -= buffer_m; ymax += buffer_m
-
-    # compute grid nx, ny for chosen resolution
-    nx = int(np.ceil((xmax - xmin) / RESOLUTION))
-    ny = int(np.ceil((ymax - ymin) / RESOLUTION))
+    # Compute radar grid
+    nx = int(np.ceil((xmax_m - xmin_m) / RESOLUTION))
+    ny = int(np.ceil((ymax_m - ymin_m) / RESOLUTION))
     nz = int(np.ceil((Z_MAX - Z_MIN) / Z_RES))
 
-    print(f"Grid dims (z,y,x): {nz}, {ny}, {nx}  (resolution {RESOLUTION} m)")
-
-    # pyart grid_limits expects ((zmin,zmax),(ymin,ymax),(xmin,xmax))
-    grid_limits = ((Z_MIN, Z_MAX), (ymin, ymax), (xmin, xmax))
+    grid_limits = ((Z_MIN, Z_MAX), (ymin_m, ymax_m), (xmin_m, xmax_m))
     grid_shape = (nz, ny, nx)
+
+    print(f"PyART Gridding Parameters:")
+    print(f"  Grid shape (z,y,x): {grid_shape}")
+    print(f"  Resolution: {RESOLUTION}m horizontal, {Z_RES}m vertical")
+    print(f"  Radar-local coordinates (for PyART gridding):")
+    print(f"    X: [{xmin_m:.0f}, {xmax_m:.0f}] meters from radar")
+    print(f"    Y: [{ymin_m:.0f}, {ymax_m:.0f}] meters from radar")
+    print(f"    Z: [{Z_MIN:.0f}, {Z_MAX:.0f}] meters altitude")
+    print(f"  Total grid size: {nx*ny*nz:,} cells")
+    print(f"  Radar location: ({RADAR_LAT:.4f}, {RADAR_LON:.4f})")
+    print(f"\n  ℹ️  PyART grids in radar-local coords, output stored in UTM for alignment with DEM/LULC\n")
 
     # S3 setup
     bucket = "unidata-nexrad-level2"
@@ -241,14 +251,39 @@ def pull_nexrad(day_filter=None, day_filter_file=None, apply_qc=True):
                 arr = grid.fields[FIELD]['data'].filled(np.nan) if hasattr(grid.fields[FIELD]['data'], 'filled') else grid.fields[FIELD]['data']
                 
                 # get timestamp; pyart grid.time is typically of shape (1,)
-                time_val = float(grid.time['data'][0])
-                units = grid.time['units']  # e.g. "seconds since 2024-01-01T00:00:00Z"
+                try:
+                    time_val = float(grid.time['data'][0])
+                    units = grid.time['units']  # e.g. "seconds since 2024-01-01T00:00:00Z"
 
-                # Extract base time from units
-                base_time_str = re.search(r"since\s+([0-9T:\-\.Z]+)", units).group(1)
-                base_time = datetime.fromisoformat(base_time_str.replace("Z", "+00:00"))
+                    # Extract base time from units
+                    base_time_str = re.search(r"since\s+([0-9T:\-\.Z]+)", units).group(1)
+                    base_time = datetime.fromisoformat(base_time_str.replace("Z", "+00:00"))
 
-                scan_time = base_time + timedelta(seconds=time_val)
+                    scan_time = base_time + timedelta(seconds=time_val)
+                    
+                    # Validate scan_time
+                    if scan_time is None:
+                        raise ValueError(f"Invalid scan_time computed: {scan_time}")
+                    
+                except Exception as time_error:
+                    # Fallback: try to get time from radar object directly
+                    print(f"Warning: Time extraction failed ({time_error}), using radar.time")
+                    try:
+                        # PyART radar objects have a time attribute
+                        radar_time = radar.time
+                        scan_time = datetime.utcfromtimestamp(radar_time['data'][0])
+                    except:
+                        # Last resort: parse from filename
+                        # KVBX20240401_120000_V06 -> 2024-04-01 12:00:00
+                        filename = s3_path.split('/')[-1]
+                        time_match = re.search(r'(\d{8})_(\d{6})', filename)
+                        if time_match:
+                            date_str = time_match.group(1)  # YYYYMMDD
+                            time_str = time_match.group(2)  # HHMMSS
+                            scan_time = datetime.strptime(f"{date_str}{time_str}", "%Y%m%d%H%M%S")
+                        else:
+                            raise ValueError(f"Could not extract time from {s3_path}")
+                
                 return arr, scan_time
                 
             except Exception as e:
@@ -261,7 +296,7 @@ def pull_nexrad(day_filter=None, day_filter_file=None, apply_qc=True):
         raise last_error
 
     # Setup for resumable processing
-    zarr_path = f"{STATION}_preserve_500m.zarr"
+    zarr_path = f"{STATION}_preserve_{int(RESOLUTION)}m.zarr"
     processed_log = "processed_files.txt"
     lock = threading.Lock()
     
@@ -295,18 +330,40 @@ def pull_nexrad(day_filter=None, day_filter_file=None, apply_qc=True):
             with lock:
                 first_write = not os.path.exists(zarr_path)
                 
+                # Debug: Print scan time being written
+                print(f"Writing scan at: {scan_time} (type: {type(scan_time)})")
+                
                 if first_write:
                     # First write - create the zarr store with full coordinates
+                    # Coordinates are in UTM (matching Sentinel-2/TerraMesh)
+                    # Note: radar is gridded in radar-local coords, but we approximate with UTM grid
+                    # This is valid for small areas (~20km) where projection distortion is minimal
+                    
+                    # Convert to numpy datetime64 explicitly
+                    time_np = np.datetime64(scan_time, 'ns')
+                    print(f"  As numpy datetime64: {time_np}")
+                    
                     new_da = xr.DataArray(
                         arr[None, ...],  # Add time dimension
                         dims=('time', 'z', 'y', 'x'),
                         coords={
-                            'time': [np.datetime64(scan_time)],
+                            'time': [time_np],
                             'z': np.linspace(Z_MIN + Z_RES/2, Z_MAX - Z_RES/2, nz),
                             'y': np.linspace(ymin + RESOLUTION/2, ymax - RESOLUTION/2, ny),
                             'x': np.linspace(xmin + RESOLUTION/2, xmax - RESOLUTION/2, nx)
                         },
-                        name='reflectivity'
+                        name='reflectivity',
+                        attrs={
+                            'crs': UTM_CRS,
+                            'crs_wkt': utm_crs.to_wkt(),
+                            'radar_lat': RADAR_LAT,
+                            'radar_lon': RADAR_LON,
+                            'radar_station': STATION,
+                            'utm_bounds': f'({xmin}, {ymin}, {xmax}, {ymax})',
+                            'patch_size_m': PATCH_SIZE_M,
+                            'resolution_m': RESOLUTION,
+                            'description': 'NEXRAD reflectivity at 500m resolution, aligned to 2640m patch boundaries in UTM'
+                        }
                     )
                     # Use explicit encoding to avoid time decoding issues
                     encoding = {
@@ -316,11 +373,15 @@ def pull_nexrad(day_filter=None, day_filter_file=None, apply_qc=True):
                 else:
                     # For appending, only include time coordinate (spatial coords already exist)
                     # Don't provide encoding - the time variable already exists with its encoding
+                    
+                    # Convert to numpy datetime64 explicitly
+                    time_np = np.datetime64(scan_time, 'ns')
+                    
                     new_da = xr.DataArray(
                         arr[None, ...],  # Add time dimension
                         dims=('time', 'z', 'y', 'x'),
                         coords={
-                            'time': [np.datetime64(scan_time)]
+                            'time': [time_np]
                         },
                         name='reflectivity'
                     )
@@ -443,5 +504,118 @@ def pull_nexrad(day_filter=None, day_filter_file=None, apply_qc=True):
     print(f"To sort by time, use: xr.open_zarr('{zarr_path}').sortby('time')")
     print(f"{'='*60}")
 
+def load_radar_for_terramesh(zarr_path):
+    """
+    Load radar data aligned to 2640m patch boundaries in UTM coordinates.
+    
+    The zarr file contains radar data at 500m resolution, stored in UTM coordinates
+    for easy alignment with DEM and LULC data.
+    
+    Parameters:
+    -----------
+    zarr_path : str
+        Path to the radar zarr file
+    
+    Returns:
+    --------
+    ds : xarray.Dataset
+        Dataset with radar data in UTM coordinates
+    """
+    import xarray as xr
+    
+    # Load the radar data
+    ds = xr.open_zarr(zarr_path)
+    
+    # Display metadata
+    attrs = ds.reflectivity.attrs
+    print(f"Radar data loaded successfully!")
+    print(f"  Coordinate system: {attrs['crs']}")
+    print(f"  Radar station: {attrs['radar_station']} at ({attrs['radar_lat']}, {attrs['radar_lon']})")
+    print(f"  UTM bounds: {attrs['utm_bounds']}")
+    print(f"  Resolution: {attrs['resolution_m']}m")
+    print(f"  Patch size: {attrs['patch_size_m']}m")
+    print(f"  Pixels per patch: {int(attrs['patch_size_m'] / attrs['resolution_m'])}×{int(attrs['patch_size_m'] / attrs['resolution_m'])}")
+    print(f"  Time range: {ds.time.min().values} to {ds.time.max().values}")
+    print(f"  Number of time steps: {len(ds.time)}")
+    print(f"\n✅ Data ready for multi-modal fusion with DEM/LULC!")
+    
+    return ds
+
+
 if __name__ == "__main__":
     pull_nexrad()
+
+
+# ==============================================================================
+# USAGE NOTES FOR MULTI-MODAL DEEP LEARNING
+# ==============================================================================
+#
+# This script creates NEXRAD radar data at 500m resolution, aligned to 2640m patch
+# boundaries in UTM coordinates. This makes it ready to fuse with DEM and LULC data
+# for multi-modal precipitation prediction using TerraMind.
+#
+# KEY POINTS:
+# -----------
+# 1. Resolution Strategy:
+#    - Radar: 500m (native resolution, ~250m beam width)
+#    - DEM/LULC: 10m (TerraMind native resolution)
+#    - Output: 5×5 grid at 500m (precipitation predictions)
+#    
+#    Each modality is processed at its optimal resolution, then fused in the model.
+#
+# 2. Coordinate System:
+#    - All data in UTM Zone 10N (EPSG:32610)
+#    - PyART grids radar in radar-local azimuthal equidistant coordinates
+#    - Output is stored in UTM for alignment with DEM/LULC
+#    - For areas <50km from radar, projection distortion is <0.5%
+#
+# 3. Patch Alignment:
+#    - Bounding box aligned to 2640m boundaries (TerraMind patch size)
+#    - Radar: 5×5 pixels per 2640m patch (at 500m resolution)
+#    - DEM/LULC: 264×264 pixels per 2640m patch (at 10m resolution)
+#    - Same geographic area, different pixel densities
+#
+# 4. Usage Example:
+#    a) Load radar data:
+#       from radar.pull_nexrad import load_radar_for_terramesh
+#       radar_ds = load_radar_for_terramesh("KVBX_preserve_500m.zarr")
+#
+#    b) Extract patch around rain gauge:
+#       gauge_x, gauge_y = 233456, 3823456  # UTM coordinates
+#       patch_size = 2640  # meters
+#       
+#       # Extract 5×5 radar patch at 500m (covers 2500m × 2500m)
+#       radar_patch = radar_ds.sel(
+#           time=target_time, method='nearest',
+#           x=slice(gauge_x - patch_size/2, gauge_x + patch_size/2),
+#           y=slice(gauge_y - patch_size/2, gauge_y + patch_size/2)
+#       ).reflectivity.values  # Shape: (z, 5, 5)
+#
+#       # Extract 264×264 DEM patch at 10m (covers 2640m × 2640m)
+#       dem_patch = dem_ds.sel(
+#           x=slice(gauge_x - patch_size/2, gauge_x + patch_size/2),
+#           y=slice(gauge_y - patch_size/2, gauge_y + patch_size/2)
+#       ).values  # Shape: (264, 264)
+#
+#    c) Feed to model:
+#       # Radar encoder processes 500m data
+#       radar_features = radar_encoder(radar_patch)  # CNN on (6, Z, 5, 5)
+#       
+#       # TerraMind processes 10m data
+#       terrain_features = terramind(dem_patch, lulc_patch)  # (264, 264)
+#       
+#       # Fusion
+#       fused = fusion_layer([radar_features, terrain_features])
+#       precip_map = decoder(fused)  # Output: (5, 5) at 500m resolution
+#
+# 5. Quality Control:
+#    - Set apply_qc=True (default) to filter ground clutter
+#    - Uses dual-pol correlation coefficient (RhoHV < 0.9 = non-meteorological)
+#    - Essential for precipitation estimation
+#
+# 6. Data Acquisition:
+#    - DEM: Download Copernicus 30m DEM, resample to 10m
+#    - LULC: Download ESRI 10m Land Cover
+#    - Both should use same UTM bounds (xmin, ymin, xmax, ymax) as radar
+#
+# ==============================================================================

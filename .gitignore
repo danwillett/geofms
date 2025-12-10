@@ -1,2 +1,9 @@
 *.zarr  
+*.pkl
 .env
+
+data/
+checkpoints/
+
+wandb/
+__pycache__/
