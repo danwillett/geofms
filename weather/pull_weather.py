@@ -468,11 +468,18 @@ def get_hourly_precipitation_by_station(start_date=None, end_date=None, min_rain
     df['hour'] = df['timestamp_utc'].dt.floor('H')
     
     hourly = df.groupby(['hour', 'station_id']).agg({
-        'rainfall_mm': 'sum',
+        'rainfall_mm': ['sum', 'max', 'count', lambda x: (x > 0).sum()],
         'station_name': 'first',
         'lat': 'first',
         'lon': 'first'
     }).reset_index()
+    
+    # Flatten multi-level columns
+    hourly.columns = ['hour', 'station_id', 'rainfall_mm', 'max_bin_mm', 'n_bins',
+                      'n_active_bins', 'station_name', 'lat', 'lon']
+    
+    # Compute dump ratio: fraction of hourly total in the single largest 10-min bin
+    hourly['dump_ratio'] = hourly['max_bin_mm'] / hourly['rainfall_mm'].clip(lower=1e-6)
     
     # Filter by minimum rainfall
     hourly = hourly[hourly['rainfall_mm'] >= min_rainfall_mm]
@@ -486,7 +493,10 @@ def get_hourly_precipitation_by_station(start_date=None, end_date=None, min_rain
             'station_name': row['station_name'],
             'lat': row['lat'],
             'lon': row['lon'],
-            'hourly_precip_mm': row['rainfall_mm']
+            'hourly_precip_mm': row['rainfall_mm'],
+            'max_bin_mm': row['max_bin_mm'],
+            'n_active_bins': int(row['n_active_bins']),
+            'dump_ratio': row['dump_ratio'],
         })
     
     print(f"\nFound {len(samples)} hourly samples with rainfall >= {min_rainfall_mm}mm")
@@ -498,9 +508,178 @@ def get_hourly_precipitation_by_station(start_date=None, end_date=None, min_rain
     return samples
 
 
-# def create_rainy_days_dict(top_days):
+def get_offset_hourly_precipitation_by_station(start_date=None, end_date=None,
+                                                min_rainfall_mm=0.1, offset_minutes=30):
+    """
+    Get hourly accumulated precipitation using offset windows (e.g. 12:30-1:30).
+
+    Same as get_hourly_precipitation_by_station but with a time offset applied
+    to the aggregation windows. This creates additional training samples that
+    are partially independent from standard hourly windows.
+
+    Parameters
+    ----------
+    offset_minutes : int
+        Offset in minutes from the top of the hour (default: 30)
+    """
+    from datetime import datetime, timedelta
+
+    if isinstance(start_date, str):
+        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+    if isinstance(end_date, str):
+        end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+
+    engine = connect()
+    session = create_session(engine)
+
+    rain_ds = session.query(DendraDatastream).filter(DendraDatastream.name.in_(["Rainfall", "Rainfall Sum"])).all()
+    rain_ds_ids = [ds.id for ds in rain_ds]
+
+    station_info = {}
+    for ds in rain_ds:
+        station = session.query(DendraStation).filter(
+            DendraStation.id == ds.station_id
+        ).first()
+        if station:
+            station_info[ds.id] = {
+                'station_id': station.id,
+                'name': station.name,
+                'lat': station.latitude,
+                'lon': station.longitude
+            }
+
+    query = session.query(
+        DendraDatapoint.timestamp_utc,
+        DendraDatapoint.datastream_id,
+        DendraDatapoint.value
+    ).filter(DendraDatapoint.datastream_id.in_(rain_ds_ids))
+
+    if start_date:
+        start_datetime = datetime.combine(start_date, datetime.min.time())
+        query = query.filter(DendraDatapoint.timestamp_utc >= start_datetime)
+    if end_date:
+        end_datetime = datetime.combine(end_date, datetime.min.time()) + timedelta(days=1)
+        query = query.filter(DendraDatapoint.timestamp_utc < end_datetime)
+
+    query = query.order_by(DendraDatapoint.timestamp_utc)
+
+    print(f"Querying precipitation data for {offset_minutes}-min offset windows...")
+    results = query.all()
+    print(f"Found {len(results)} measurements")
+
+    if len(results) == 0:
+        return []
+
+    df = pd.DataFrame(results, columns=['timestamp_utc', 'datastream_id', 'rainfall_mm'])
+
+    df['station_id'] = df['datastream_id'].map(lambda x: station_info.get(x, {}).get('station_id'))
+    df['station_name'] = df['datastream_id'].map(lambda x: station_info.get(x, {}).get('name'))
+    df['lat'] = df['datastream_id'].map(lambda x: station_info.get(x, {}).get('lat'))
+    df['lon'] = df['datastream_id'].map(lambda x: station_info.get(x, {}).get('lon'))
+
+    # Shift timestamps back by offset, then floor to hour, then shift forward
+    offset = pd.Timedelta(minutes=offset_minutes)
+    df['offset_hour'] = (df['timestamp_utc'] - offset).dt.floor('H') + offset
+
+    hourly = df.groupby(['offset_hour', 'station_id']).agg({
+        'rainfall_mm': ['sum', 'max', 'count', lambda x: (x > 0).sum()],
+        'station_name': 'first',
+        'lat': 'first',
+        'lon': 'first'
+    }).reset_index()
+
+    # Flatten multi-level columns
+    hourly.columns = ['offset_hour', 'station_id', 'rainfall_mm', 'max_bin_mm', 'n_bins',
+                      'n_active_bins', 'station_name', 'lat', 'lon']
+
+    # Compute dump ratio
+    hourly['dump_ratio'] = hourly['max_bin_mm'] / hourly['rainfall_mm'].clip(lower=1e-6)
+
+    hourly = hourly[hourly['rainfall_mm'] >= min_rainfall_mm]
+
+    samples = []
+    for _, row in hourly.iterrows():
+        samples.append({
+            'hour_start': row['offset_hour'],
+            'station_id': row['station_id'],
+            'station_name': row['station_name'],
+            'lat': row['lat'],
+            'lon': row['lon'],
+            'hourly_precip_mm': row['rainfall_mm'],
+            'max_bin_mm': row['max_bin_mm'],
+            'n_active_bins': int(row['n_active_bins']),
+            'dump_ratio': row['dump_ratio'],
+        })
+
+    print(f"\nFound {len(samples)} offset hourly samples with rainfall >= {min_rainfall_mm}mm")
+    return samples
 #     """Incomplete function - not currently used"""
 #     pass
+
+
+def get_rainy_hours_set(day_list, min_rainfall_mm=0.01):
+    """
+    Return a set of naive UTC datetime objects (floored to the hour) where
+    at least one gauge recorded rainfall >= min_rainfall_mm.
+
+    Used by pull_nexrad_multi to skip radar scans during dry hours, which
+    dramatically reduces the number of files that need to be gridded.
+
+    Parameters
+    ----------
+    day_list : list of datetime.date
+        The days to query (typically your rainy-days filter list).
+    min_rainfall_mm : float
+        Minimum hourly network-wide rainfall sum to consider the hour "rainy".
+        Default is 0.01 mm — effectively "any measurable rain at all."
+
+    Returns
+    -------
+    rainy_hours : set of datetime
+        Naive UTC datetimes, each truncated to the hour.
+        Example: {datetime(2024, 9, 8, 6, 0, 0), ...}
+    """
+    engine  = connect()
+    session = create_session(engine)
+
+    rain_ds     = session.query(DendraDatastream).filter(
+        DendraDatastream.name.in_(["Rainfall", "Rainfall Sum"])
+    ).all()
+    rain_ds_ids = [ds.id for ds in rain_ds]
+
+    start_dt = datetime.combine(min(day_list), datetime.min.time())
+    end_dt   = datetime.combine(max(day_list), datetime.min.time()) + timedelta(days=1)
+
+    results = (
+        session.query(
+            DendraDatapoint.timestamp_utc,
+            DendraDatapoint.value,
+        )
+        .filter(DendraDatapoint.datastream_id.in_(rain_ds_ids))
+        .filter(DendraDatapoint.timestamp_utc >= start_dt)
+        .filter(DendraDatapoint.timestamp_utc <  end_dt)
+        .all()
+    )
+    session.close()
+
+    if not results:
+        print("  ⚠ No gauge data found — rainy-hour filter will keep ALL files.")
+        return set()
+
+    df = pd.DataFrame(results, columns=['timestamp_utc', 'rainfall_mm'])
+    df['hour'] = df['timestamp_utc'].dt.floor('h')
+
+    # Sum across all stations per hour; keep hours with any measurable rain
+    hourly_network = df.groupby('hour')['rainfall_mm'].sum()
+    rainy_hours    = set(hourly_network[hourly_network >= min_rainfall_mm].index)
+
+    # Strip timezone info so comparisons with naive datetimes (from filenames) work
+    rainy_hours = {h.replace(tzinfo=None) if hasattr(h, 'tzinfo') else h
+                   for h in rainy_hours}
+
+    print(f"  Gauge DB: {len(rainy_hours)} rainy hours found across {len(day_list)} days "
+          f"({len(rainy_hours) / max(len(day_list), 1):.1f} rainy hrs/day on average)")
+    return rainy_hours
 
 
 def save_rainy_days_list(filename='rainy_days_ranked.txt', top_n=100, min_rainfall=None,

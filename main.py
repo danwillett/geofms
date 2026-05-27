@@ -4,6 +4,8 @@ Main entry point for NEXRAD + rain gauge ML pipeline
 Run from project root to ensure proper .env loading
 """
 
+import datetime as dt
+from radar.pull_nexrad_multi import pull_nexrad_multi
 from weather.pull_weather import get_hourly_precipitation_by_station, save_rainy_days_list, get_rainfall_days, label_rain_events, rank_days_by_rainfall_intensity
 from radar.pull_nexrad import pull_nexrad
 from radar.visualize_nexrad import show_nexrad, show_dem_with_stations
@@ -12,7 +14,7 @@ from radar.diagnose_zarr import diagnose_zarr
 # from radar.validate_nexrad import validate_nexrad
 
 
-def find_best_training_days(top_n=20, output_file='my_rainy_days.txt', max_valid_rainfall=100.0):
+def find_best_training_days(top_n=20, start_date='2020-01-01', end_date='2026-3-28', max_valid_rainfall=100.0):
     """
     Find the best rainy days for ML training.
     
@@ -35,14 +37,16 @@ def find_best_training_days(top_n=20, output_file='my_rainy_days.txt', max_valid
     print("="*70)
     print("\nLooking for days with widespread, consistent rain...")
     print("(Not just days with single extreme spikes!)\n")
+
+    output_file = f"weather/days/top_{top_n}_days_{start_date}_{end_date}.txt"
     
     # Find top N days ranked by number of rain-hours
     top_days, day_stats = rank_days_by_rainfall_intensity(
         top_n=top_n,
         metric='rain_hours',           # Counts station-hours with rain
-        min_rainfall=0.3,              # Count hours with > 0.3 mm/hr
-        start_date='2020-01-01',       # Extended date range
-        end_date='2025-12-31',         # Through end of 2025
+        min_rainfall=0.5,              # Count hours with > 0.5 mm/hr
+        start_date=start_date,       # Extended date range
+        end_date=end_date,         # Through end of 2025
         max_valid_rainfall=max_valid_rainfall  # Filter sensor errors
     )
     
@@ -76,7 +80,7 @@ def find_best_training_days(top_n=20, output_file='my_rainy_days.txt', max_valid
     print(f"✓ Found {len(top_days)} excellent training days!")
     print("="*70 + "\n")
     
-    return top_days, day_stats
+    return output_file
 
 
 def prepare_training_data(train_years=None, val_years=None, max_valid_rainfall=100.0):
@@ -141,43 +145,49 @@ if __name__ == "__main__":
     # ============================================================
     # Uncomment to find days with widespread, consistent rain
     # (not just days with single sensor spikes!)
+
+    START_DATE = dt.date(2022, 1, 1)
+    END_DATE   = dt.date(2026, 4, 4)
+
+    rainy_file = find_best_training_days(
+        top_n=100,                              # Find top 100 rainy days
+        start_date=START_DATE.strftime('%Y-%m-%d'),
+        end_date=END_DATE.strftime('%Y-%m-%d'),
+        max_valid_rainfall=100.0               # Filter out sensor errors > 100 mm/hr
+    )
     
-    # find_best_training_days(
-    #     top_n=100,                      # Find top 50 rainy days
-    #     output_file='my_rainy_days_100.txt',
-    #     max_valid_rainfall=100.0       # Filter out sensor errors > 100 mm/hr
-    # )
+    # # ============================================================
+    # # STEP 2: Pull NEXRAD radar for those days
+    # # ============================================================
+    # # Uncomment after STEP 1 completes
     
-    # ============================================================
-    # STEP 2: Pull NEXRAD radar for those days
-    # ============================================================
-    # Uncomment after STEP 1 completes
+    print("\n🌧️  Pulling NEXRAD radar data for rainy days...")
+    zarr_path = pull_nexrad_multi(
+        day_filter_file=rainy_file,
+        apply_qc=True,
+        start_date=START_DATE,
+        end_date=END_DATE,
+    )
     
-    # print("\n🌧️  Pulling NEXRAD radar data for rainy days...")
-    # pull_nexrad(
-    #     day_filter_file='my_rainy_days_75.txt',
-    #     apply_qc=True
-    # )
-    
-    # test_precip()
+    test_precip()
 
     # ============================================================
-    # STEP 3: Prepare training dataset
+    # STEP 3: Build training pickle from zarr
     # ============================================================
     # Uncomment after STEP 2 completes
-    
-    # Option A: Temporal split (recommended for scientific rigor)
-    # prepare_training_data(
-    #     train_years=[2023],      # Use 2023 data for training
-    #     val_years=[2024],        # Use 2024 data for validation
-    #     max_valid_rainfall=100.0
-    # )
-    
-    # Option B: Random split (faster testing, but less rigorous)
-    # prepare_training_data(
-    #     train_years=None,        # Random 80/20 split
-    #     val_years=None,
-    #     max_valid_rainfall=100.0
+
+    # from dataset.create_pickle import create_training_samples
+    # # zarr_path = r"radar\outputs\dualpol_500m_2022-01-01_2026-04-04.zarr"
+    # # rainy_file = r"weather\days\top_100_days_2022-01-01_2026-04-04.txt"
+    # pickle_path = create_training_samples(
+    #     radar_zarr_path=zarr_path,
+    #     output_path='dataset/outputs/3d/radar_gauge_dataset_tr22_24_26_vl_23_25.pkl',
+    #     dem_path='dem/preserve_dem_10m_utm.tif',
+    #     train_years=[2022, 2024, 2026],   # adjust to match zarr date range
+    #     val_years=[2023, 2025],
+    #     day_filter_file=rainy_file,
+    #     max_valid_rainfall=100.0,
+    #     patch_size_m=4500,
     # )
     
     # ============================================================
@@ -185,7 +195,7 @@ if __name__ == "__main__":
     # ============================================================
     # Uncomment to see radar reflectivity maps
     
-    show_nexrad(datetime_target="2025-11-15 15")
+    # show_nexrad(datetime_target="2025-11-15 15")
     # show_dem_with_stations(dem_path='preserve_dem_10m_utm.tif')
 
     

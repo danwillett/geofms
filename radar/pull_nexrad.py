@@ -43,22 +43,28 @@ def pull_nexrad(day_filter=None, day_filter_file=None, apply_qc=True):
     STATION = "KVBX"
     RADAR_LAT, RADAR_LON = 34.83855, -120.397917
     RESOLUTION = 500.0  # radar horizontal spacing in meters (native resolution)
-    Z_MIN, Z_MAX, Z_RES = 0.0, 15000.0, 375.0
+    Z_MIN, Z_MAX, Z_RES = 0.0, 8000.0, 375.0  # 22 levels; coastal CA echo tops rarely exceed 7-8km (Ralph 2004, Neiman 2002)
     PRESERVE_BBOX = (-120.5130681, 34.5775648, -120.3456914, 34.4344052)  # study AOI (west, north, east, south)
     PATCH_SIZE_M = 2640  # TerraMesh patch size in meters
     UTM_CRS = "EPSG:32610"  # UTM Zone 10N for California coast
     BUFFER_M = 5000  # Add 5km buffer around preserve
 
     START_DATE = dt.date(2022, 10, 1)
-    END_DATE   = dt.date(2025, 5, 12)
+    END_DATE   = dt.date(2026, 3, 27)
 
     # Threading settings
-    MAX_WORKERS = 30  # Number of parallel downloads/processing threads
-    FIELD = 'reflectivity'
+    MAX_WORKERS = 10  # Number of parallel downloads/processing threads
+    FIELDS = [
+        'reflectivity',
+        'differential_reflectivity',   # ZDR
+        'cross_correlation_ratio',      # RhoHV
+        'differential_phase',           # PhiDP
+        'specific_differential_phase',  # KDP (computed from PhiDP)
+    ]
     
     # Quality control settings
-    APPLY_QC = apply_qc  # Apply dual-pol QC to remove clutter
-    QC_FIELDS = ['reflectivity']  # Fields to apply QC mask to
+    APPLY_QC = apply_qc
+    QC_FIELDS = ['reflectivity', 'differential_reflectivity']  # Apply QC mask to Z and ZDR
     # -------------------------------------------------
     
     print(f"\n📐 Resolution: {RESOLUTION}m (native radar resolution)")
@@ -236,20 +242,72 @@ def pull_nexrad(day_filter=None, day_filter_file=None, apply_qc=True):
                             qc_stats['files_with_qc'] += 1
                         else:
                             qc_stats['files_without_qc'] += 1
-                
-                # grid only requested limits/shape, and request the field
+
+                # Compute KDP from PhiDP — gracefully skip if PhiDP unavailable or computation fails
+                if 'differential_phase' in radar.fields:
+                    try:
+                        kdp, phidp_cor, *_ = pyart.retrieve.kdp_maesaka(radar)  # * handles 2- or 3-value return across PyART versions
+                        radar.add_field('specific_differential_phase', kdp, replace_existing=True)
+                    except Exception as kdp_err:
+                        print(f"  KDP computation failed, skipping: {kdp_err}")
+
+                # Only grid fields that are actually present in this radar volume
+                fields_to_grid = [f for f in FIELDS if f in radar.fields]
+
                 grid = pyart.map.grid_from_radars(
                     [radar],
                     grid_shape=grid_shape,
                     grid_limits=grid_limits,
                     grid_origin=(RADAR_LAT, RADAR_LON),
-                    fields=[FIELD],
-                    form='linear'  # or 'barnes' depending on your preference
+                    fields=fields_to_grid,
+                    form='linear'
                 )
-                
-                # extract field array (z,y,x)
-                arr = grid.fields[FIELD]['data'].filled(np.nan) if hasattr(grid.fields[FIELD]['data'], 'filled') else grid.fields[FIELD]['data']
-                
+
+                # Extract each gridded field into a dict of (z, y, x) float arrays
+                field_arrays_3d = {}
+                ref_data = None
+                for field_name in fields_to_grid:
+                    raw = grid.fields[field_name]['data']
+                    arr = raw.filled(np.nan) if hasattr(raw, 'filled') else np.array(raw, dtype=float)
+
+                    # KDP noise mask: unreliable in light rain / below-threshold regions
+                    if field_name == 'specific_differential_phase' and ref_data is not None:
+                        arr = np.where(ref_data >= 20.0, arr, np.nan)
+
+                    field_arrays_3d[field_name] = arr
+                    if field_name == 'reflectivity':
+                        ref_data = arr  # save for KDP mask above
+
+                # --- Collapse Z dimension → 2D (y, x) ---
+                # Reflectivity : column maximum (CMAX) — standard approach
+                # All dual-pol : sampled at the HEIGHT of max reflectivity (collocated)
+                #   → ZDR/KDP/RhoHV at the dominant echo level, not independent maxima
+                # This is ~40× smaller than storing all 40 Z levels and matches what
+                # the model does anyway (torch.max over Z at training time).
+                field_arrays = {}
+                if 'reflectivity' in field_arrays_3d:
+                    ref_3d = field_arrays_3d['reflectivity']               # (z, y, x)
+                    field_arrays['reflectivity'] = np.nanmax(ref_3d, axis=0)  # (y, x)
+
+                    # Z-index of max reflectivity at every (y, x) pixel.
+                    # Substitute -inf for NaN so argmax handles all-NaN (clear-air) columns
+                    # without raising ValueError. Those pixels return z=0 and will sample NaN
+                    # from the dual-pol arrays anyway → correctly NaN in the output.
+                    ref_safe = np.where(np.isfinite(ref_3d), ref_3d, -np.inf)
+                    z_idx = np.argmax(ref_safe, axis=0)                    # (y, x)
+                    ny_g, nx_g = ref_3d.shape[1], ref_3d.shape[2]
+                    yy, xx = np.meshgrid(np.arange(ny_g), np.arange(nx_g), indexing='ij')
+
+                    # Sample every dual-pol field at the level of max-Z
+                    for field_name, arr_3d in field_arrays_3d.items():
+                        if field_name == 'reflectivity':
+                            continue
+                        field_arrays[field_name] = arr_3d[z_idx, yy, xx]  # (y, x)
+                else:
+                    # Fallback: nanmax across Z for all fields if reflectivity missing
+                    for field_name, arr_3d in field_arrays_3d.items():
+                        field_arrays[field_name] = np.nanmax(arr_3d, axis=0)
+
                 # get timestamp; pyart grid.time is typically of shape (1,)
                 try:
                     time_val = float(grid.time['data'][0])
@@ -284,7 +342,7 @@ def pull_nexrad(day_filter=None, day_filter_file=None, apply_qc=True):
                         else:
                             raise ValueError(f"Could not extract time from {s3_path}")
                 
-                return arr, scan_time
+                return field_arrays, scan_time
                 
             except Exception as e:
                 last_error = e
@@ -296,7 +354,7 @@ def pull_nexrad(day_filter=None, day_filter_file=None, apply_qc=True):
         raise last_error
 
     # Setup for resumable processing
-    zarr_path = f"{STATION}_preserve_{int(RESOLUTION)}m.zarr"
+    zarr_path = f"{STATION}_preserve_{int(RESOLUTION)}m_{START_DATE}_{END_DATE}.zarr"
     processed_log = "processed_files.txt"
     lock = threading.Lock()
     
@@ -324,80 +382,80 @@ def pull_nexrad(day_filter=None, day_filter_file=None, apply_qc=True):
         
         try:
             # Process the file (this happens outside the lock for parallelism)
-            arr, scan_time = grid_radar_file_from_s3(s3_path)
-            
+            field_arrays, scan_time = grid_radar_file_from_s3(s3_path)
+
             # Write to zarr (must be thread-safe)
             with lock:
                 first_write = not os.path.exists(zarr_path)
-                
-                # Debug: Print scan time being written
-                print(f"Writing scan at: {scan_time} (type: {type(scan_time)})")
-                
-                if first_write:
-                    # First write - create the zarr store with full coordinates
-                    # Coordinates are in UTM (matching Sentinel-2/TerraMesh)
-                    # Note: radar is gridded in radar-local coords, but we approximate with UTM grid
-                    # This is valid for small areas (~20km) where projection distortion is minimal
-                    
-                    # Convert to numpy datetime64 explicitly
-                    time_np = np.datetime64(scan_time, 'ns')
-                    print(f"  As numpy datetime64: {time_np}")
-                    
-                    new_da = xr.DataArray(
-                        arr[None, ...],  # Add time dimension
-                        dims=('time', 'z', 'y', 'x'),
-                        coords={
-                            'time': [time_np],
-                            'z': np.linspace(Z_MIN + Z_RES/2, Z_MAX - Z_RES/2, nz),
+
+                # Convert to numpy datetime64 explicitly
+                time_np = np.datetime64(scan_time, 'ns')
+                print(f"Writing scan at: {scan_time}")
+
+                # Metadata attrs stored on each variable
+                shared_attrs = {
+                    'crs': UTM_CRS,
+                    'crs_wkt': utm_crs.to_wkt(),
+                    'radar_lat': RADAR_LAT,
+                    'radar_lon': RADAR_LON,
+                    'radar_station': STATION,
+                    'utm_bounds': f'({xmin}, {ymin}, {xmax}, {ymax})',
+                    'patch_size_m': PATCH_SIZE_M,
+                    'resolution_m': RESOLUTION,
+                    'description': (
+                        'NEXRAD dual-pol radar at 500m resolution, Z-collapsed to 2D (y, x). '
+                        'reflectivity = column maximum (CMAX) over 0–8000m (22 levels at 375m spacing). '
+                        '8000m ceiling justified for coastal CA: echo tops rarely exceed 7–8km '
+                        '(Ralph et al. 2004; Neiman et al. 2002). '
+                        'ZDR, RhoHV, PhiDP, KDP = sampled at height of max reflectivity (collocated). '
+                        'KDP masked where Z < 20 dBZ. '
+                        'Aligned to 2640m patch boundaries in UTM.'
+                    ),
+                }
+
+                def make_dataset(field_arrays, time_np, include_spatial=True):
+                    """Build an xr.Dataset from a dict of 2D (y, x) arrays for one timestep."""
+                    coords = {'time': [time_np]}
+                    if include_spatial:
+                        coords.update({
                             'y': np.linspace(ymin + RESOLUTION/2, ymax - RESOLUTION/2, ny),
-                            'x': np.linspace(xmin + RESOLUTION/2, xmax - RESOLUTION/2, nx)
-                        },
-                        name='reflectivity',
-                        attrs={
-                            'crs': UTM_CRS,
-                            'crs_wkt': utm_crs.to_wkt(),
-                            'radar_lat': RADAR_LAT,
-                            'radar_lon': RADAR_LON,
-                            'radar_station': STATION,
-                            'utm_bounds': f'({xmin}, {ymin}, {xmax}, {ymax})',
-                            'patch_size_m': PATCH_SIZE_M,
-                            'resolution_m': RESOLUTION,
-                            'description': 'NEXRAD reflectivity at 500m resolution, aligned to 2640m patch boundaries in UTM'
-                        }
-                    )
-                    # Use explicit encoding to avoid time decoding issues
+                            'x': np.linspace(xmin + RESOLUTION/2, xmax - RESOLUTION/2, nx),
+                        })
+                    data_vars = {
+                        name: xr.DataArray(
+                            arr[None, ...],  # add time dim → (1, y, x)
+                            dims=('time', 'y', 'x'),
+                            attrs=shared_attrs,
+                        )
+                        for name, arr in field_arrays.items()
+                    }
+                    return xr.Dataset(data_vars, coords=coords)
+
+                if first_write:
+                    # First write — create zarr store with full spatial coordinates
+                    # (valid approximation for small AOI <50 km from radar)
+                    print(f"  As numpy datetime64: {time_np}")
+                    ds = make_dataset(field_arrays, time_np, include_spatial=True)
                     encoding = {
                         'time': {'units': 'nanoseconds since 1970-01-01', 'calendar': 'proleptic_gregorian'}
                     }
-                    new_da.to_zarr(zarr_path, mode='w', encoding=encoding)
+                    ds.to_zarr(zarr_path, mode='w', encoding=encoding)
                 else:
-                    # For appending, only include time coordinate (spatial coords already exist)
-                    # Don't provide encoding - the time variable already exists with its encoding
-                    
-                    # Convert to numpy datetime64 explicitly
-                    time_np = np.datetime64(scan_time, 'ns')
-                    
-                    new_da = xr.DataArray(
-                        arr[None, ...],  # Add time dimension
-                        dims=('time', 'z', 'y', 'x'),
-                        coords={
-                            'time': [time_np]
-                        },
-                        name='reflectivity'
-                    )
-                    
+                    # Append — spatial coords already in store, only supply time
+                    ds = make_dataset(field_arrays, time_np, include_spatial=False)
+
                     # Retry zarr write if Windows file locking causes issues
                     max_write_retries = 3
                     for write_attempt in range(max_write_retries):
                         try:
-                            new_da.to_zarr(zarr_path, append_dim='time')
-                            break  # Success!
-                        except PermissionError as pe:
+                            ds.to_zarr(zarr_path, append_dim='time')
+                            break  # success
+                        except PermissionError:
                             if write_attempt < max_write_retries - 1:
                                 time.sleep(0.2 * (write_attempt + 1))  # 0.2s, 0.4s, 0.6s
                             else:
-                                raise  # Give up after 3 attempts
-                
+                                raise  # give up after 3 attempts
+
                 # Log successful processing after successful write
                 with open(processed_log, 'a') as f:
                     f.write(s3_path + "\n")
@@ -506,46 +564,62 @@ def pull_nexrad(day_filter=None, day_filter_file=None, apply_qc=True):
 
 def load_radar_for_terramesh(zarr_path):
     """
-    Load radar data aligned to 2640m patch boundaries in UTM coordinates.
-    
-    The zarr file contains radar data at 500m resolution, stored in UTM coordinates
-    for easy alignment with DEM and LULC data.
-    
-    Parameters:
-    -----------
+    Load dual-pol radar data aligned to 2640m patch boundaries in UTM coordinates.
+
+    The zarr file contains a 2D (time, y, x) multi-variable Dataset at 500m
+    resolution — the Z dimension has been pre-collapsed for storage efficiency:
+
+    Variables
+    ---------
+    reflectivity                : Z  (dBZ)  — column maximum reflectivity (CMAX)
+    differential_reflectivity   : ZDR (dB)  — drop oblateness at level of max-Z
+    cross_correlation_ratio     : RhoHV     — echo quality at level of max-Z
+    differential_phase          : PhiDP (°) — cumulative phase at level of max-Z
+    specific_differential_phase : KDP (°/km)— rain rate proxy at level of max-Z
+                                  (NaN where Z < 20 dBZ)
+
+    All dual-pol fields are sampled at the height of maximum reflectivity
+    (collocated), which is physically correct and ~40× smaller than storing
+    all 40 Z levels.
+
+    Parameters
+    ----------
     zarr_path : str
-        Path to the radar zarr file
-    
-    Returns:
-    --------
+        Path to the radar zarr file.
+
+    Returns
+    -------
     ds : xarray.Dataset
-        Dataset with radar data in UTM coordinates
+        Dataset with shape (time, y, x) for all dual-pol variables.
     """
     import xarray as xr
-    
-    # Load the radar data
+
+    # Load the radar dataset
     ds = xr.open_zarr(zarr_path)
-    
-    # Display metadata
-    attrs = ds.reflectivity.attrs
+
+    # Read shared metadata from reflectivity (always present)
+    attrs = ds['reflectivity'].attrs
     print(f"Radar data loaded successfully!")
-    print(f"  Coordinate system: {attrs['crs']}")
-    print(f"  Radar station: {attrs['radar_station']} at ({attrs['radar_lat']}, {attrs['radar_lon']})")
-    print(f"  UTM bounds: {attrs['utm_bounds']}")
-    print(f"  Resolution: {attrs['resolution_m']}m")
-    print(f"  Patch size: {attrs['patch_size_m']}m")
-    print(f"  Pixels per patch: {int(attrs['patch_size_m'] / attrs['resolution_m'])}×{int(attrs['patch_size_m'] / attrs['resolution_m'])}")
-    print(f"  Time range: {ds.time.min().values} to {ds.time.max().values}")
-    print(f"  Number of time steps: {len(ds.time)}")
+    print(f"  Coordinate system : {attrs.get('crs', 'N/A')}")
+    print(f"  Radar station     : {attrs.get('radar_station')} "
+          f"at ({attrs.get('radar_lat')}, {attrs.get('radar_lon')})")
+    print(f"  UTM bounds        : {attrs.get('utm_bounds')}")
+    print(f"  Resolution        : {attrs.get('resolution_m')}m")
+    print(f"  Patch size        : {attrs.get('patch_size_m')}m  "
+          f"→ {int(attrs.get('patch_size_m', 0) / attrs.get('resolution_m', 1))}×"
+          f"{int(attrs.get('patch_size_m', 0) / attrs.get('resolution_m', 1))} pixels/patch")
+    print(f"  Variables         : {list(ds.data_vars)}")
+    print(f"  Time range        : {ds.time.min().values} to {ds.time.max().values}")
+    print(f"  Number of scans   : {len(ds.time)}")
     print(f"\n✅ Data ready for multi-modal fusion with DEM/LULC!")
-    
+
     return ds
 
 
 if __name__ == "__main__":
     pull_nexrad()
 
-
+ 
 # ==============================================================================
 # USAGE NOTES FOR MULTI-MODAL DEEP LEARNING
 # ==============================================================================
