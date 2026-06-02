@@ -424,9 +424,8 @@ def save_config(run_dir, cfg, n_params, train_samples, val_samples, model):
             cfg.get('use_temporal_pos', True), cfg.get('use_dem', True)
         ),
         'n_encoder_blocks': cfg.get('n_encoder_blocks', 3),
-        'spatial_head': cfg.get('spatial_head', False),
         'encoder_channels': encoder_channels,
-        'decoder_hidden_dim': getattr(model.decoder, 'fc1', None) and model.decoder.fc1.out_features,
+        'decoder_hidden_dim': model.decoder.fc1.out_features,
         'dropout_rate': cfg.get('dropout_rate', 0.25),
         'input_size': f'{model.decoder.output_size}x{model.decoder.output_size}',
         'output_size': model.decoder.output_size,
@@ -531,7 +530,6 @@ def train(cfg: dict = None, run_name: str = None):
         output_size=patch_pixels,
         scalar_output=cfg.get('scalar_output', False),
         n_encoder_blocks=n_encoder_blocks,
-        spatial_head=cfg.get('spatial_head', False),
     ).to(device)
     model.apply(init_weights)
 

@@ -15,7 +15,7 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 
 from models.unet.model import PrecipUNet, init_weights
-from models.stack.dataset import RadarGaugeDataset
+from models.unet.dataset import RadarGaugeDataset, resolve_fields, compute_n_input_channels
 from models.unet.train import filter_bad_samples, filter_biased_extremes, filter_nan_radar, filter_suspect_station_days, filter_stations, filter_radar_unsupported
 
 DEFAULT_PICKLE   = 'dataset/outputs/radar_gauge_dataset_with_offsets_9500.pkl'
@@ -50,18 +50,27 @@ def load_model(checkpoint_path, device):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt.get('config', {})
 
+    # Reconstruct channel count from config
+    fields = resolve_fields(cfg.get('fields'))
+    use_dem = cfg.get('use_dem', True)
+    use_mask = cfg.get('use_mask', True)
+    use_temporal_pos = cfg.get('use_temporal_pos', True)
+    in_channels = compute_n_input_channels(fields, use_mask, use_temporal_pos, use_dem)
+
     model = PrecipUNet(
+        in_channels=in_channels,
         base_filters=cfg.get('base_filters', 64),
         dropout_rate=cfg.get('dropout_rate', 0.15),
+        n_encoder_blocks=cfg.get('n_encoder_blocks', 3),
     )
     model.load_state_dict(ckpt['model_state_dict'])
     model.to(device)
     model.eval()
-    print("✓ Model loaded successfully!")
+    print(f"✓ Model loaded (in_channels={in_channels}, fields={fields})")
     return model, cfg
 
 
-def run_inference(model, val_loader, device):
+def run_inference(model, val_loader, device, log_target=True):
     all_preds = []
     all_targets = []
     all_station_names = []
@@ -70,7 +79,7 @@ def run_inference(model, val_loader, device):
     with torch.no_grad():
         for batch in val_loader:
             radar = batch['radar'].to(device)
-            target = torch.expm1(batch['target'])
+            target = batch['target']
             gauge_pixel = batch['gauge_pixel']
             bias_flag = batch.get('bias_flag')
             station_names = batch.get('station_name', [])
@@ -99,6 +108,10 @@ def run_inference(model, val_loader, device):
                     pred_at_gauge = pred_map[batch_idx, y, x]
                 else:
                     pred_at_gauge = pred_map[:, 2, 2]
+
+            if log_target:
+                pred_at_gauge = torch.expm1(pred_at_gauge)
+                target = torch.expm1(target)
 
             all_preds.extend(pred_at_gauge.numpy().tolist())
             all_targets.extend(target.numpy().tolist())
@@ -387,10 +400,23 @@ def evaluate(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, dem_pa
 
     model, cfg = load_model(ckpt, device)
 
+    # Prefer paths from checkpoint config for reproducibility
+    pickle_path = cfg.get('pickle_path') or pickle_path
+    dem_path = cfg.get('dem_path') or dem_path
+
     # Use exclude_stations from config if not explicitly provided
     exclude = exclude_stations or cfg.get('exclude_stations', [])
 
-    val_ds = RadarGaugeDataset(pickle_path, dem_path=dem_path, split='val', augment=False)
+    # Reconstruct dataset with same feature config as training
+    ds_kwargs = dict(
+        dem_path=dem_path,
+        fields=cfg.get('fields'),
+        use_dem=cfg.get('use_dem', True),
+        use_mask=cfg.get('use_mask', True),
+        use_temporal_pos=cfg.get('use_temporal_pos', True),
+        log_target=cfg.get('log_target', True),
+    )
+    val_ds = RadarGaugeDataset(pickle_path, split='val', augment=False, **ds_kwargs)
     val_ds.samples = filter_stations(val_ds.samples, exclude)
     val_ds.samples = filter_nan_radar(val_ds.samples)
     filter_mode = cfg.get('filter_mode', 'blunt')
@@ -403,7 +429,9 @@ def evaluate(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, dem_pa
 
     val_loader = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=0, pin_memory=True)
 
-    preds_mm, targets_mm, station_names = run_inference(model, val_loader, device)
+    preds_mm, targets_mm, station_names = run_inference(
+        model, val_loader, device, log_target=cfg.get('log_target', True)
+    )
     metrics = compute_metrics(preds_mm, targets_mm)
     print_report(preds_mm, targets_mm, metrics)
     plot_evaluation(preds_mm, targets_mm, metrics, output_dir, run_dir=run_dir)
@@ -433,7 +461,14 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
     print(f"{'='*60}")
     print(f"  Hourly test samples: {len(test_samples)}")
 
-    test_ds = RadarGaugeDataset(pickle_path, dem_path=dem_path, split='test', augment=False)
+    test_ds = RadarGaugeDataset(
+        pickle_path, dem_path=dem_path, split='test', augment=False,
+        fields=cfg.get('fields'),
+        use_dem=cfg.get('use_dem', True),
+        use_mask=cfg.get('use_mask', True),
+        use_temporal_pos=cfg.get('use_temporal_pos', True),
+        log_target=cfg.get('log_target', True),
+    )
     test_ds.samples = filter_nan_radar(test_ds.samples)
     test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=0, pin_memory=True)
 
@@ -468,7 +503,10 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
                     pred_at_gauge = pred_map[:, 2, 2]
 
             for i in range(pred_at_gauge.shape[0]):
-                hourly_preds.append(max(0.0, pred_at_gauge[i].item()))
+                pred_val = pred_at_gauge[i].item()
+                if cfg.get('log_target', True):
+                    pred_val = np.expm1(pred_val)
+                hourly_preds.append(max(0.0, pred_val))
                 sample = test_ds.samples[sample_idx]
                 hourly_meta.append({
                     'date': sample['date'],

@@ -1,86 +1,51 @@
 """
-ablation.py — Feature ablation study for the U-Net precipitation model.
+ablation.py — Feature ablation study for the Stack CNN precipitation model.
 
 Systematically zeros out feature groups to measure their contribution to
 prediction performance.
 
 Run from the project root:
-    python -m models.unet.ablation
-    python -m models.unet.ablation --run-dir models/checkpoints/unet_dualpol/2026-05-28_...
+    python -m models.stack.ablation
+    python -m models.stack.ablation --checkpoint checkpoints/stack_dualpol/best-epoch=13-val_loss=0.1966.pt
 """
 
 import argparse
-import json
 import numpy as np
 import torch
 from pathlib import Path
 from torch.utils.data import DataLoader
 
-from models.unet.model import PrecipUNet
-from models.unet.dataset import (
-    RadarGaugeDataset, resolve_fields, compute_n_input_channels, N_SCANS,
-)
-from models.unet.evaluate import find_checkpoint, load_model
-from models.unet.train import (
+from models.stack.model import PrecipitationStackModel
+from models.stack.dataset import RadarGaugeDataset
+from models.stack.evaluate import find_checkpoint, load_model
+from models.stack.train import (
     filter_nan_radar, filter_biased_extremes,
     filter_bad_samples, filter_suspect_station_days,
-    filter_radar_unsupported,
 )
 
 DEFAULT_PICKLE = 'dataset/outputs/radar_gauge_dataset_tr22_24_26_vl_23_25.pkl'
 DEFAULT_DEM = 'dem/preserve_dem_10m_utm.tif'
 DEFAULT_CKPT_DIR = 'models/checkpoints/stack_dualpol'
 
+N_SCANS = RadarGaugeDataset.N_SCANS  # 12
+N_FIELDS = len(RadarGaugeDataset.FIELDS)  # 4
 
-def build_feature_groups(fields, use_mask=True, use_temporal_pos=True, use_dem=True):
-    """Dynamically build feature group channel indices from a field list."""
-    groups = {}
-    n_fields = len(fields)
-
-    # Individual field groups
-    for i, field in enumerate(fields):
-        groups[field] = list(range(i * N_SCANS, (i + 1) * N_SCANS))
-
-    # Composite groups
-    dualpol_fields = ['differential_reflectivity', 'cross_correlation_ratio',
-                      'specific_differential_phase']
-    vertical_fields = ['echo_top_height', 'max_z_height', 'vil',
-                       'low_level_ref', 'column_depth_fraction']
-
-    dualpol_channels = []
-    for f in dualpol_fields:
-        if f in fields:
-            idx = fields.index(f)
-            dualpol_channels.extend(range(idx * N_SCANS, (idx + 1) * N_SCANS))
-    if dualpol_channels:
-        groups['all_dualpol'] = dualpol_channels
-
-    vert_channels = []
-    for f in vertical_fields:
-        if f in fields:
-            idx = fields.index(f)
-            vert_channels.extend(range(idx * N_SCANS, (idx + 1) * N_SCANS))
-    if vert_channels:
-        groups['all_vertical'] = vert_channels
-
-    # Auxiliary channels (after field channels)
-    offset = n_fields * N_SCANS
-    if use_mask:
-        groups['mask'] = list(range(offset, offset + N_SCANS))
-        offset += N_SCANS
-    if use_temporal_pos:
-        groups['temporal_pos'] = list(range(offset, offset + N_SCANS))
-        offset += N_SCANS
-    if use_dem:
-        groups['dem'] = [offset]
-
-    return groups
+FEATURE_GROUPS = {
+    'reflectivity': list(range(0, N_SCANS)),
+    'zdr': list(range(N_SCANS, 2 * N_SCANS)),
+    'rho_hv': list(range(2 * N_SCANS, 3 * N_SCANS)),
+    'kdp': list(range(3 * N_SCANS, 4 * N_SCANS)),
+    'mask': list(range(N_FIELDS * N_SCANS, N_FIELDS * N_SCANS + N_SCANS)),
+    'temporal_pos': list(range(N_FIELDS * N_SCANS + N_SCANS, N_FIELDS * N_SCANS + 2 * N_SCANS)),
+    'dem': [N_FIELDS * N_SCANS + 2 * N_SCANS],
+    'all_dualpol': list(range(N_SCANS, 4 * N_SCANS)),
+}
 
 
-def run_ablation_inference(model, dataloader, device, zero_channels=None, log_target=True):
+def run_ablation_inference(model, dataloader, device, zero_channels=None):
     """Run inference with optional channel zeroing."""
-    all_preds = []
-    all_targets = []
+    all_preds_log = []
+    all_targets_log = []
 
     with torch.no_grad():
         for batch in dataloader:
@@ -111,19 +76,15 @@ def run_ablation_inference(model, dataloader, device, zero_channels=None, log_ta
                 else:
                     pred_at_gauge = pred_map[:, 4, 4]
 
-            if log_target:
-                pred_at_gauge = torch.expm1(pred_at_gauge)
-                target = torch.expm1(target)
+            all_preds_log.extend(pred_at_gauge.numpy().tolist())
+            all_targets_log.extend(target.numpy().tolist())
 
-            all_preds.extend(pred_at_gauge.numpy().tolist())
-            all_targets.extend(target.numpy().tolist())
+    preds_log = np.array(all_preds_log)
+    targets_log = np.array(all_targets_log)
 
-    preds_mm = np.array(all_preds)
-    targets_mm = np.array(all_targets)
-
-    valid = targets_mm >= 0
-    preds_mm = preds_mm[valid]
-    targets_mm = targets_mm[valid]
+    valid = targets_log >= 0
+    preds_mm = np.expm1(preds_log[valid])
+    targets_mm = np.expm1(targets_log[valid])
 
     return preds_mm, targets_mm
 
@@ -165,33 +126,11 @@ def run_ablation(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, de
 
     model, cfg = load_model(ckpt, device)
 
-    # Reconstruct dataset with same feature config as training
-    fields = resolve_fields(cfg.get('fields'))
-    use_dem = cfg.get('use_dem', True)
-    use_mask = cfg.get('use_mask', True)
-    use_temporal_pos = cfg.get('use_temporal_pos', True)
-
-    ds_kwargs = dict(
-        dem_path=dem_path,
-        fields=fields,
-        use_dem=use_dem,
-        use_mask=use_mask,
-        use_temporal_pos=use_temporal_pos,
-        log_target=cfg.get('log_target', True),
-    )
-    val_ds = RadarGaugeDataset(pickle_path, split='val', augment=False, **ds_kwargs)
+    val_ds = RadarGaugeDataset(pickle_path, dem_path=dem_path, split='val', augment=False)
     val_ds.samples = filter_nan_radar(val_ds.samples)
-    filter_mode = cfg.get('filter_mode', 'blunt')
-    if filter_mode == 'radar':
-        val_ds.samples = filter_radar_unsupported(val_ds.samples)
-    else:
-        val_ds.samples = filter_biased_extremes(val_ds.samples)
-        val_ds.samples = filter_bad_samples(val_ds.samples)
+    val_ds.samples = filter_biased_extremes(val_ds.samples)
+    val_ds.samples = filter_bad_samples(val_ds.samples)
     val_ds.samples = filter_suspect_station_days(val_ds.samples)
-
-    # Build dynamic feature groups for this model's configuration
-    feature_groups = build_feature_groups(fields, use_mask, use_temporal_pos, use_dem)
-    n_channels = compute_n_input_channels(fields, use_mask, use_temporal_pos, use_dem)
 
     print(f"\nAblation dataset: {len(val_ds.samples)} validation samples")
     val_loader = DataLoader(val_ds, batch_size=64, shuffle=False, num_workers=0, pin_memory=True)
@@ -202,14 +141,11 @@ def run_ablation(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, de
     print(f"{'='*70}")
     print(f"\n  Checkpoint: {ckpt}")
     print(f"  Samples:    {len(val_ds.samples)}")
-    print(f"  Channels:   {n_channels}")
-    print(f"  Fields:     {fields}")
+    print(f"  Channels:   {RadarGaugeDataset.n_input_channels()}")
     print(f"{'='*70}")
 
-    log_target = cfg.get('log_target', True)
-
     print("\n  Running baseline (all features)...")
-    preds_mm, targets_mm = run_ablation_inference(model, val_loader, device, zero_channels=None, log_target=log_target)
+    preds_mm, targets_mm = run_ablation_inference(model, val_loader, device, zero_channels=None)
     baseline = compute_metrics(preds_mm, targets_mm)
 
     print(f"  Baseline: R²={baseline['r2']:.4f}  MAE={baseline['mae']:.3f}  "
@@ -218,9 +154,9 @@ def run_ablation(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, de
     # Run each ablation
     results = {'baseline': baseline}
 
-    for group_name, channels in feature_groups.items():
+    for group_name, channels in FEATURE_GROUPS.items():
         print(f"\n  Ablating: {group_name} (channels {channels[0]}-{channels[-1]}, n={len(channels)})...")
-        preds_mm, targets_mm = run_ablation_inference(model, val_loader, device, zero_channels=channels, log_target=log_target)
+        preds_mm, targets_mm = run_ablation_inference(model, val_loader, device, zero_channels=channels)
         metrics = compute_metrics(preds_mm, targets_mm)
         results[group_name] = metrics
 
@@ -243,7 +179,7 @@ def run_ablation(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, de
           f"{baseline['rmse']:>8.3f} {baseline['heavy_mae']:>8.3f} {'---':>10}")
 
     ranked = []
-    for group_name in feature_groups:
+    for group_name in FEATURE_GROUPS:
         m = results[group_name]
         delta_r2 = m['r2'] - baseline['r2']
         delta_mae = m['mae'] - baseline['mae']

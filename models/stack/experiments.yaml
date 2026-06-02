@@ -1,0 +1,105 @@
+# Stack model experiments
+# Run with: python -m models.run_experiments models/stack/experiments.yaml
+# Dry run:  python -m models.run_experiments models/stack/experiments.yaml --dry-run
+# Subset:   python -m models.run_experiments models/stack/experiments.yaml --only stack_dualpol_raw
+
+base:
+  pickle: dataset/outputs/3d/radar_gauge_dataset_vertical_9500.pkl
+  dem: dem/preserve_dem_10m_utm.tif
+  patience: 20
+  epochs: 100
+  batch_size: 32
+  lr: 5.0e-5
+  no_sampler: true
+
+experiments:
+  # ----------------------------------------------------------------
+  # BLUNT FILTER
+  # ----------------------------------------------------------------
+
+  # ── 1a) Baseline: dualpol, no log, weighted_mae ──
+  # - name: wmae_nolog_bluntfilter_nosampler_dualpol
+  #   model_type: stack
+  #   filter_mode: blunt
+  #   features: dualpol
+  #   loss: weighted_mae
+  #   log_target: false
+
+  # # ── 1b) Add vertical features ──
+  # - name: wmae_nolog_bluntfilter_nosampler_dualpolvert
+  #   model_type: stack
+  #   filter_mode: blunt
+  #   features: dualpol+vertical
+  #   loss: weighted_mae
+  #   log_target: false
+
+  # # ── 2a) Baseline: dualpol, with log, weighted_mae ──
+  # - name: wmae_log_bluntfilter_nosampler_dualpol
+  #   model_type: stack
+  #   filter_mode: blunt
+  #   features: dualpol
+  #   loss: weighted_mae
+  #   log_target: true
+
+  # ── 2b) Add vertical features -wide ──
+  # - name: wmae_nolog_bluntfilter_nosampler_dualpolvert_wide
+  #   model_type: stack
+  #   filter_mode: blunt
+  #   features: dualpol+vertical
+  #   loss: weighted_mae
+  #   log_target: false
+  #   width: wide
+
+
+  # # ── 2b) Add vertical features ──
+  # - name: wmae_log_bluntfilter_nosampler_dualpolvert
+  #   model_type: stack
+  #   filter_mode: blunt
+  #   features: dualpol+vertical
+  #   loss: weighted_mae
+  #   log_target: true
+
+  # ── 2a) Baseline: dualpol, with log, weighted_mae ──
+
+
+  # # ── 2b) Add vertical features -wide ──
+  # - name: wmae_log_bluntfilter_nosampler_dualpolvert_wide
+  #   model_type: stack
+  #   filter_mode: blunt
+  #   features: dualpol+vertical
+  #   loss: weighted_mae
+  #   log_target: true
+  #   width: wide
+
+  # # ── 2c) Add vertical features - extrawide ──
+  # - name: wmae_log_bluntfilter_nosampler_dualpolvert_wide
+  #   model_type: stack
+  #   filter_mode: blunt
+  #   features: dualpol+vertical
+  #   loss: weighted_mae
+  #   log_target: true
+  #   width: extra_wide
+
+  # ----------------------------------------------------------------
+  # SPATIAL HEAD (no adaptive avg pool — preserves spatial structure)
+  # ----------------------------------------------------------------
+
+  # ── 3a) Spatial head: log, wide ──
+  - name: wmae_log_blunt_nosampler_dualpolvert_xwide_spatial
+    model_type: stack
+    filter_mode: blunt
+    features: dualpol+vertical
+    loss: weighted_mae
+    log_target: true
+    width: extra_wide
+    spatial_head: true
+
+  # ── 3b) Spatial head: nolog, wide ──
+  # - name: wmae_nolog_blunt_dualpolvert_wide_spatial
+  #   model_type: stack
+  #   filter_mode: blunt
+  #   features: dualpol+vertical
+  #   loss: weighted_mae
+  #   log_target: false
+  #   width: wide
+  #   spatial_head: true

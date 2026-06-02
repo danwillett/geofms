@@ -41,6 +41,11 @@ FIELDS = [
     'cross_correlation_ratio',
     'differential_phase',
     'specific_differential_phase',
+    'echo_top_height',
+    'max_z_height',
+    'vil',
+    'low_level_ref',
+    'column_depth_fraction',
 ]
 
 # Station bias flags  (1 = over-estimator, -1 = under-estimator, 0 = unknown)

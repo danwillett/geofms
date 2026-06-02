@@ -64,7 +64,6 @@ def load_model(checkpoint_path, device):
         output_size=cfg.get('output_size', 9),
         scalar_output=cfg.get('scalar_output', False),
         n_encoder_blocks=cfg.get('n_encoder_blocks', 3),
-        spatial_head=cfg.get('spatial_head', False),
     )
     model.load_state_dict(ckpt['model_state_dict'])
     model.to(device)

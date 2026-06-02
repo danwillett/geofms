@@ -14,14 +14,14 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from torch.utils.data import DataLoader
 
-from models.stack.model import PrecipitationStackModel
-from models.unet.dataset import RadarGaugeDataset, resolve_fields, compute_n_input_channels
-from models.stack.train import filter_bad_samples, filter_biased_extremes, filter_nan_radar, filter_suspect_station_days, filter_stations
+from models.unet.model import PrecipUNet, init_weights
+from models.stack.dataset import RadarGaugeDataset
+from models.unet.train import filter_bad_samples, filter_biased_extremes, filter_nan_radar, filter_suspect_station_days, filter_stations, filter_radar_unsupported
 
-DEFAULT_PICKLE   = 'dataset/outputs/radar_gauge_dataset_tr22_24_26_vl_23_25.pkl'
+DEFAULT_PICKLE   = 'dataset/outputs/radar_gauge_dataset_with_offsets_9500.pkl'
 DEFAULT_DEM      = 'dem/preserve_dem_10m_utm.tif'
-DEFAULT_CKPT_DIR = 'models/checkpoints/stack_dualpol'
-DEFAULT_OUTPUT   = 'evaluation_figures/stack_dualpol'
+DEFAULT_CKPT_DIR = 'models/checkpoints/unet_dualpol'
+DEFAULT_OUTPUT   = 'evaluation_figures/unet_dualpol'
 
 
 def find_checkpoint(checkpoint_path=None, checkpoint_dir=None, run_dir=None):
@@ -50,21 +50,9 @@ def load_model(checkpoint_path, device):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt.get('config', {})
 
-    # Reconstruct channel count from config
-    fields = resolve_fields(cfg.get('fields'))
-    use_dem = cfg.get('use_dem', True)
-    use_mask = cfg.get('use_mask', True)
-    use_temporal_pos = cfg.get('use_temporal_pos', True)
-    in_channels = compute_n_input_channels(fields, use_mask, use_temporal_pos, use_dem)
-
-    model = PrecipitationStackModel(
-        in_channels=in_channels,
-        latent_dim=cfg.get('latent_dim', 256),
-        add_bias=cfg.get('add_bias', False),
-        output_size=cfg.get('output_size', 9),
-        scalar_output=cfg.get('scalar_output', False),
-        n_encoder_blocks=cfg.get('n_encoder_blocks', 3),
-        spatial_head=cfg.get('spatial_head', False),
+    model = PrecipUNet(
+        base_filters=cfg.get('base_filters', 64),
+        dropout_rate=cfg.get('dropout_rate', 0.15),
     )
     model.load_state_dict(ckpt['model_state_dict'])
     model.to(device)
@@ -73,7 +61,7 @@ def load_model(checkpoint_path, device):
     return model, cfg
 
 
-def run_inference(model, val_loader, device, log_target=True):
+def run_inference(model, val_loader, device):
     all_preds = []
     all_targets = []
     all_station_names = []
@@ -82,7 +70,7 @@ def run_inference(model, val_loader, device, log_target=True):
     with torch.no_grad():
         for batch in val_loader:
             radar = batch['radar'].to(device)
-            target = batch['target']
+            target = torch.expm1(batch['target'])
             gauge_pixel = batch['gauge_pixel']
             bias_flag = batch.get('bias_flag')
             station_names = batch.get('station_name', [])
@@ -116,16 +104,12 @@ def run_inference(model, val_loader, device, log_target=True):
             all_targets.extend(target.numpy().tolist())
             all_station_names.extend(station_names)
 
-    preds = np.array(all_preds)
-    targets = np.array(all_targets)
+    preds_mm = np.array(all_preds)
+    targets_mm = np.array(all_targets)
 
-    valid = targets >= 0
-    if log_target:
-        preds_mm = np.expm1(preds[valid])
-        targets_mm = np.expm1(targets[valid])
-    else:
-        preds_mm = preds[valid]
-        targets_mm = targets[valid]
+    valid = targets_mm >= 0
+    preds_mm = preds_mm[valid]
+    targets_mm = targets_mm[valid]
     station_names = np.array(all_station_names)[valid]
 
     print(f"✓ Collected {valid.sum()} valid samples")
@@ -403,28 +387,14 @@ def evaluate(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, dem_pa
 
     model, cfg = load_model(ckpt, device)
 
-    # Prefer paths from checkpoint config for reproducibility
-    pickle_path = cfg.get('pickle_path') or pickle_path
-    dem_path = cfg.get('dem_path') or dem_path
-
     # Use exclude_stations from config if not explicitly provided
     exclude = exclude_stations or cfg.get('exclude_stations', [])
 
-    # Reconstruct dataset with same feature config as training
-    ds_kwargs = dict(
-        dem_path=dem_path,
-        fields=cfg.get('fields'),
-        use_dem=cfg.get('use_dem', True),
-        use_mask=cfg.get('use_mask', True),
-        use_temporal_pos=cfg.get('use_temporal_pos', True),
-        log_target=cfg.get('log_target', True),
-    )
-    val_ds = RadarGaugeDataset(pickle_path, split='val', augment=False, **ds_kwargs)
+    val_ds = RadarGaugeDataset(pickle_path, dem_path=dem_path, split='val', augment=False)
     val_ds.samples = filter_stations(val_ds.samples, exclude)
     val_ds.samples = filter_nan_radar(val_ds.samples)
     filter_mode = cfg.get('filter_mode', 'blunt')
     if filter_mode == 'radar':
-        from models.unet.train import filter_radar_unsupported
         val_ds.samples = filter_radar_unsupported(val_ds.samples)
     else:
         val_ds.samples = filter_biased_extremes(val_ds.samples)
@@ -433,8 +403,7 @@ def evaluate(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, dem_pa
 
     val_loader = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=0, pin_memory=True)
 
-    log_target = cfg.get('log_target', True)
-    preds_mm, targets_mm, station_names = run_inference(model, val_loader, device, log_target=log_target)
+    preds_mm, targets_mm, station_names = run_inference(model, val_loader, device)
     metrics = compute_metrics(preds_mm, targets_mm)
     print_report(preds_mm, targets_mm, metrics)
     plot_evaluation(preds_mm, targets_mm, metrics, output_dir, run_dir=run_dir)
@@ -448,7 +417,7 @@ def evaluate(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, dem_pa
 
 
 def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir=None):
-    """Evaluate model on daily cumulative gauge test set (stack model in log-space)."""
+    """Evaluate model on daily cumulative gauge test set."""
     import pickle as pkl
 
     with open(pickle_path, 'rb') as f:
@@ -464,18 +433,11 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
     print(f"{'='*60}")
     print(f"  Hourly test samples: {len(test_samples)}")
 
-    test_ds = RadarGaugeDataset(
-        pickle_path, split='test', augment=False,
-        dem_path=dem_path,
-        fields=cfg.get('fields'),
-        use_dem=cfg.get('use_dem', True),
-        use_mask=cfg.get('use_mask', True),
-        use_temporal_pos=cfg.get('use_temporal_pos', True),
-        log_target=cfg.get('log_target', True),
-    )
+    test_ds = RadarGaugeDataset(pickle_path, dem_path=dem_path, split='test', augment=False)
     test_ds.samples = filter_nan_radar(test_ds.samples)
     test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=0, pin_memory=True)
 
+    # Run hourly inference
     hourly_preds = []
     hourly_meta = []
     sample_idx = 0
@@ -484,13 +446,8 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
         for batch in test_loader:
             radar = batch['radar'].to(device)
             gauge_pixel = batch['gauge_pixel']
-            bias_flag = batch.get('bias_flag')
 
-            if model.add_bias and bias_flag is not None:
-                pred_map = model(radar, bias_flag.to(device))
-            else:
-                pred_map = model(radar)
-
+            pred_map = model(radar)
             pred_map = pred_map.cpu()
 
             if pred_map.dim() == 1:
@@ -510,14 +467,8 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
                 else:
                     pred_at_gauge = pred_map[:, 2, 2]
 
-            # Convert from log-space to mm (only if log_target was used)
-            if cfg.get('log_target', True):
-                preds_mm_batch = np.expm1(pred_at_gauge.numpy())
-            else:
-                preds_mm_batch = pred_at_gauge.numpy()
-
-            for i in range(preds_mm_batch.shape[0]):
-                hourly_preds.append(max(0.0, preds_mm_batch[i]))
+            for i in range(pred_at_gauge.shape[0]):
+                hourly_preds.append(max(0.0, pred_at_gauge[i].item()))
                 sample = test_ds.samples[sample_idx]
                 hourly_meta.append({
                     'date': sample['date'],
@@ -543,6 +494,7 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
     hours_per_day = np.array([v['count'] for v in daily_groups.values()])
     station_names_daily = [v['station_name'] for v in daily_groups.values()]
 
+    # Only keep days with sufficient coverage (>=18 hours)
     valid = hours_per_day >= 18
     pred_daily = pred_daily[valid]
     actual_daily = actual_daily[valid]
@@ -552,6 +504,7 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
         print("  No valid day-station groups with >=18 hours. Skipping.")
         return
 
+    # Metrics
     test_metrics = compute_metrics(pred_daily, actual_daily)
 
     print(f"\n  Day-station groups: {len(pred_daily)} (≥18 hrs coverage)")
@@ -562,6 +515,7 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
     print(f"  Pred range: {pred_daily.min():.2f} – {pred_daily.max():.2f} mm/day")
     print(f"  Actual range: {actual_daily.min():.2f} – {actual_daily.max():.2f} mm/day")
 
+    # Save test results
     if run_dir:
         results_path = Path(run_dir) / 'test_results.txt'
         lines = [
@@ -581,6 +535,7 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
             f.write('\n'.join(lines) + '\n')
         print(f"  ✓ Saved test results to: {results_path}")
 
+    # Plot
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -601,11 +556,13 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
     ax = axes[1]
     unique_stations = sorted(set(station_names_daily))
     station_short = [s.replace('Dangermond_', '') for s in unique_stations]
+    station_mae = []
     station_bias = []
     for station in unique_stations:
         mask = station_names_daily == station
         s_preds = pred_daily[mask]
         s_actual = actual_daily[mask]
+        station_mae.append(np.mean(np.abs(s_preds - s_actual)))
         station_bias.append(np.mean(s_preds - s_actual))
 
     x_pos = np.arange(len(unique_stations))

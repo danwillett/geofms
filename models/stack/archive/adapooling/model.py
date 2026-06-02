@@ -42,12 +42,6 @@ class RadarEncoder(nn.Module):
         self.dropout_fc1 = nn.Dropout(p=dropout_rate)
         self.fc2 = nn.Linear(1024, latent_dim)
 
-    @property
-    def final_channels(self):
-        """Number of output channels from the last conv block."""
-        channel_sizes = [192, 384, 512, 640, 768][:self.n_blocks]
-        return channel_sizes[-1]
-
     def forward(self, x):
         for i in range(self.n_blocks):
             x = F.relu(self.bn_blocks[i](self.conv_blocks[i](x)))
@@ -60,15 +54,6 @@ class RadarEncoder(nn.Module):
         x = F.relu(self.fc1(x))
         x = self.dropout_fc1(x)
         return self.fc2(x)
-
-    def forward_spatial(self, x):
-        """Forward pass that preserves spatial dimensions (no pooling to vector)."""
-        for i in range(self.n_blocks):
-            x = F.relu(self.bn_blocks[i](self.conv_blocks[i](x)))
-            x = self.dropout_blocks[i](x)
-            if i in self.pool_after:
-                x = F.max_pool2d(x, 2)
-        return x
 
 
 class ScalarDecoder(nn.Module):
@@ -94,39 +79,6 @@ class ScalarDecoder(nn.Module):
         x = F.relu(self.ln2(self.fc2(x)))
         x = self.dropout2(x)
         return self.fc_out(x).squeeze(-1)
-
-
-class SpatialConvHead(nn.Module):
-    """
-    Convolutional decoder head that preserves spatial structure.
-    Takes the encoder's spatial feature maps and produces a precipitation map
-    without collapsing through a vector bottleneck.
-    """
-
-    def __init__(self, in_channels, output_size, dropout_rate=0.1):
-        super().__init__()
-        self.output_size = output_size
-
-        self.head = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // 2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(in_channels // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(p=dropout_rate),
-            nn.Conv2d(in_channels // 2, in_channels // 4, kernel_size=3, padding=1),
-            nn.BatchNorm2d(in_channels // 4),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // 4, 1, kernel_size=1),
-        )
-
-    def forward(self, x):
-        x = self.head(x)
-        x = x.squeeze(1)  # [B, 1, H, W] -> [B, H, W]
-        if x.shape[-1] != self.output_size:
-            x = F.interpolate(
-                x.unsqueeze(1), size=(self.output_size, self.output_size),
-                mode='bilinear', align_corners=False,
-            ).squeeze(1)
-        return x
 
 
 class PrecipitationDecoder(nn.Module):
@@ -165,18 +117,13 @@ class PrecipitationStackModel(nn.Module):
     """
     Complete CNN model for precipitation prediction from dual-pol radar + DEM.
     Dynamic encoder depth via n_encoder_blocks parameter.
-
-    When spatial_head=True, uses a convolutional decoder that preserves spatial
-    structure from the encoder, avoiding the vector bottleneck that causes
-    prediction capping.
     """
 
     def __init__(self, in_channels=73, latent_dim=512, add_bias=False,
                  dropout_rate=0.25, output_size=9, scalar_output=False,
-                 n_encoder_blocks=3, spatial_head=False):
+                 n_encoder_blocks=3):
         super().__init__()
         self.scalar_output = scalar_output
-        self.spatial_head = spatial_head
 
         self.radar_encoder = RadarEncoder(
             in_channels=in_channels,
@@ -188,34 +135,23 @@ class PrecipitationStackModel(nn.Module):
         self.add_bias = add_bias
         self.bias_embedding = nn.Embedding(num_embeddings=3, embedding_dim=32)
 
-        if spatial_head and not scalar_output:
-            self.decoder = SpatialConvHead(
-                in_channels=self.radar_encoder.final_channels,
-                output_size=output_size,
+        decoder_input_dim = latent_dim + 32 if add_bias else latent_dim
+
+        if scalar_output:
+            self.decoder = ScalarDecoder(
+                input_dim=decoder_input_dim,
+                hidden_dim=512,
                 dropout_rate=0.1,
             )
         else:
-            decoder_input_dim = latent_dim + 32 if add_bias else latent_dim
-
-            if scalar_output:
-                self.decoder = ScalarDecoder(
-                    input_dim=decoder_input_dim,
-                    hidden_dim=512,
-                    dropout_rate=0.1,
-                )
-            else:
-                self.decoder = PrecipitationDecoder(
-                    input_dim=decoder_input_dim,
-                    hidden_dim=1024,
-                    output_size=output_size,
-                    dropout_rate=0.1,
-                )
+            self.decoder = PrecipitationDecoder(
+                input_dim=decoder_input_dim,
+                hidden_dim=1024,
+                output_size=output_size,
+                dropout_rate=0.1,
+            )
 
     def forward(self, radar, bias_flag=None):
-        if self.spatial_head and not self.scalar_output:
-            feat_map = self.radar_encoder.forward_spatial(radar)
-            return self.decoder(feat_map)
-
         emb = self.radar_encoder(radar)
 
         if self.add_bias and bias_flag is not None:

@@ -23,10 +23,11 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 def _process_one_file(args):
     """
-    Download, grid, and Z-collapse a single NEXRAD file.
+    Download and grid a single NEXRAD file into a full 3D volume.
     Runs in a worker process — completely independent of all other workers.
 
-    Returns (field_arrays, scan_time) on success, or None on failure.
+    Returns (field_arrays_3d, z_heights, scan_time) on success, or None on failure.
+    field_arrays_3d maps field name -> (nz, ny, nx) array; no Z-collapse is done.
     """
     (s3_path, grid_shape, grid_limits, radar_lat, radar_lon,
      fields, apply_qc, qc_fields) = args
@@ -99,77 +100,23 @@ def _process_one_file(args):
                 form='linear'
             )
 
-            # Extract 3D arrays
+            # Extract 3D arrays — the FULL vertical volume is retained (no
+            # Z-collapse) so all vertical-structure features can be derived
+            # offline later via radar/derive_features.py without re-pulling S3.
+            # The KDP (Z < 20 dBZ) mask is intentionally NOT applied here so
+            # warm-rain signal at low reflectivity is preserved; denoise in
+            # post-processing instead.
             field_arrays_3d = {}
-            ref_data = None
             for field_name in fields_to_grid:
                 raw = grid.fields[field_name]['data']
                 arr = raw.filled(_np.nan) if hasattr(raw, 'filled') else _np.array(raw, dtype=float)
-                if field_name == 'specific_differential_phase' and ref_data is not None:
-                    arr = _np.where(ref_data >= 20.0, arr, _np.nan)
                 field_arrays_3d[field_name] = arr
-                if field_name == 'reflectivity':
-                    ref_data = arr
 
-            # Collapse Z → 2D + derive vertical structure features
-            field_arrays = {}
-            if 'reflectivity' in field_arrays_3d:
-                ref_3d = field_arrays_3d['reflectivity']  # (nz, ny, nx)
-                nz_grid = ref_3d.shape[0]
-
-                # Vertical level heights (metres above radar)
-                z_min, z_max = grid_limits[0]
-                z_res = (z_max - z_min) / nz_grid
-                z_heights = _np.linspace(z_min + z_res / 2, z_max - z_res / 2, nz_grid)
-
-                # --- Standard 2D composites (existing behaviour) ---
-                field_arrays['reflectivity'] = _np.nanmax(ref_3d, axis=0)
-                ref_safe = _np.where(_np.isfinite(ref_3d), ref_3d, -_np.inf)
-                z_idx = _np.argmax(ref_safe, axis=0)
-
-                # --- Derived vertical features ---
-
-                # Echo top height: highest level with Z >= 18 dBZ (metres)
-                echo_mask = ref_3d >= 18.0
-                has_echo = _np.any(echo_mask, axis=0)
-                echo_top_idx = nz_grid - 1 - _np.argmax(echo_mask[::-1, :, :], axis=0)
-                echo_top = z_heights[echo_top_idx]
-                field_arrays['echo_top_height'] = _np.where(has_echo, echo_top, 0.0)
-
-                # Max reflectivity height (metres)
-                max_z_height = z_heights[z_idx]
-                max_z_height = _np.where(
-                    _np.isfinite(field_arrays['reflectivity']), max_z_height, 0.0
-                )
-                field_arrays['max_z_height'] = max_z_height
-
-                # VIL — Vertically Integrated Liquid (kg/m²)
-                ref_linear = 10.0 ** (ref_3d / 10.0)
-                ref_linear = _np.where(_np.isfinite(ref_linear), ref_linear, 0.0)
-                field_arrays['vil'] = 3.44e-6 * _np.nansum(
-                    ref_linear ** (4.0 / 7.0) * z_res, axis=0
-                )
-
-                # Low-level mean reflectivity (0–2 km)
-                low_mask = z_heights <= 2000.0
-                if low_mask.any():
-                    field_arrays['low_level_ref'] = _np.nanmean(ref_3d[low_mask, :, :], axis=0)
-                else:
-                    field_arrays['low_level_ref'] = field_arrays['reflectivity'].copy()
-
-                # Column depth fraction: fraction of levels with Z > 10 dBZ
-                precip_levels = _np.sum(ref_3d > 10.0, axis=0).astype(_np.float32)
-                field_arrays['column_depth_fraction'] = precip_levels / nz_grid
-
-                # --- Collapse dual-pol fields at height of max Z ---
-                ny_g, nx_g = ref_3d.shape[1], ref_3d.shape[2]
-                yy, xx = _np.meshgrid(_np.arange(ny_g), _np.arange(nx_g), indexing='ij')
-                for field_name, arr_3d in field_arrays_3d.items():
-                    if field_name != 'reflectivity':
-                        field_arrays[field_name] = arr_3d[z_idx, yy, xx]
-            else:
-                for field_name, arr_3d in field_arrays_3d.items():
-                    field_arrays[field_name] = _np.nanmax(arr_3d, axis=0)
+            # Vertical level heights (metres above radar), one per Z level.
+            nz_grid = grid_shape[0]
+            z_min, z_max = grid_limits[0]
+            z_res = (z_max - z_min) / nz_grid
+            z_heights = _np.linspace(z_min + z_res / 2, z_max - z_res / 2, nz_grid)
 
             # Extract timestamp
             try:
@@ -189,7 +136,7 @@ def _process_one_file(args):
                     else:
                         raise ValueError(f"Cannot extract time from {s3_path}")
 
-            return field_arrays, scan_time
+            return field_arrays_3d, z_heights, scan_time
 
         except Exception as e:
             if attempt < max_retries - 1:
@@ -357,8 +304,8 @@ def pull_nexrad_multi(day_filter=None, day_filter_file=None, apply_qc=True, star
         print(f"  ⚠ Rainy-hour filter failed ({filter_err}) — processing all files.")
 
     # ── RESUMABLE LOG ──────────────────────────────────────────────────────────
-    zarr_path     = f"./radar/outputs/dualpol_{int(RESOLUTION)}m_{START_DATE}_{END_DATE}.zarr"
-    processed_log = f"./radar/logs/processed_files_{int(RESOLUTION)}m_{START_DATE}_{END_DATE}.txt"
+    zarr_path     = f"./radar/outputs/dualpol_3d_{int(RESOLUTION)}m_{START_DATE}_{END_DATE}.zarr"
+    processed_log = f"./radar/logs/processed_files_3d_{int(RESOLUTION)}m_{START_DATE}_{END_DATE}.txt"
 
     processed_files = set()
     if os.path.exists(processed_log):
@@ -384,21 +331,26 @@ def pull_nexrad_multi(day_filter=None, day_filter_file=None, apply_qc=True, star
         'patch_size_m'  : PATCH_SIZE_M,
         'resolution_m'  : RESOLUTION,
         'description'   : (
-            'NEXRAD dual-pol radar at 500m resolution, Z-collapsed to 2D (y, x). '
-            'reflectivity = column maximum (CMAX) over 0-8000m (22 levels at 375m spacing). '
-            'ZDR, RhoHV, PhiDP, KDP = sampled at height of max reflectivity (collocated). '
-            'KDP masked where Z < 20 dBZ. Aligned to 2640m patch boundaries in UTM.'
+            'NEXRAD dual-pol radar at 500m resolution, FULL 3D volume (z, y, x). '
+            'Fields: reflectivity, differential_reflectivity (ZDR), '
+            'cross_correlation_ratio (RhoHV), differential_phase (PhiDP), '
+            'specific_differential_phase (KDP). 22 Z levels at 375m spacing over '
+            '0-8000m above radar; z coordinate = metres above radar. '
+            'No Z-collapse and NO KDP Z-threshold mask applied — derive 2D '
+            'features offline with radar/derive_features.py. '
+            'Aligned to 2640m patch boundaries in UTM.'
         ),
     }
 
-    def make_dataset(field_arrays, time_np, include_spatial=True):
+    def make_dataset(field_arrays_3d, time_np, z_heights, include_spatial=True):
         coords = {'time': [time_np]}
         if include_spatial:
+            coords['z'] = np.asarray(z_heights)
             coords['y'] = np.linspace(ymin + RESOLUTION/2, ymax - RESOLUTION/2, ny)
             coords['x'] = np.linspace(xmin + RESOLUTION/2, xmax - RESOLUTION/2, nx)
         data_vars = {
-            name: xr.DataArray(arr[None, ...], dims=('time', 'y', 'x'), attrs=shared_attrs)
-            for name, arr in field_arrays.items()
+            name: xr.DataArray(arr[None, ...], dims=('time', 'z', 'y', 'x'), attrs=shared_attrs)
+            for name, arr in field_arrays_3d.items()
         }
         return xr.Dataset(data_vars, coords=coords)
 
@@ -437,20 +389,25 @@ def pull_nexrad_multi(day_filter=None, day_filter_file=None, apply_qc=True, star
                 failed += 1
                 continue
 
-            field_arrays, scan_time = result
+            field_arrays_3d, z_heights, scan_time = result
             time_np = np.datetime64(scan_time, 'ns')
             print(f"Writing scan at: {scan_time}")
 
             # ── ZARR WRITE (main process only, no lock needed) ────────────────
             try:
                 if first_write:
-                    ds = make_dataset(field_arrays, time_np, include_spatial=True)
-                    ds.to_zarr(zarr_path, mode='w',
-                               encoding={'time': {'units': 'nanoseconds since 1970-01-01',
-                                                  'calendar': 'proleptic_gregorian'}})
+                    ds = make_dataset(field_arrays_3d, time_np, z_heights, include_spatial=True)
+                    # One scan per time-chunk; keep full volume per chunk so the
+                    # 3D archive stays cheap to append and to read column-wise.
+                    nz_c, ny_c, nx_c = grid_shape
+                    encoding = {'time': {'units': 'nanoseconds since 1970-01-01',
+                                         'calendar': 'proleptic_gregorian'}}
+                    for name in ds.data_vars:
+                        encoding[name] = {'chunks': (1, nz_c, ny_c, nx_c)}
+                    ds.to_zarr(zarr_path, mode='w', encoding=encoding)
                     first_write = False
                 else:
-                    ds = make_dataset(field_arrays, time_np, include_spatial=False)
+                    ds = make_dataset(field_arrays_3d, time_np, z_heights, include_spatial=False)
                     for write_attempt in range(3):
                         try:
                             ds.to_zarr(zarr_path, append_dim='time')

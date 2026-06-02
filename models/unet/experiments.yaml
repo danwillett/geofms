@@ -1,0 +1,179 @@
+# Systematic feature experiments for U-Net precipitation models
+# Run with: python -m models.run_experiments models/unet/experiments.yaml
+# Dry run:  python -m models.run_experiments models/unet/experiments.yaml --dry-run
+# Subset:   python -m models.run_experiments models/unet/experiments.yaml --only unet_dualpol_raw
+
+base:
+  pickle: dataset/outputs/3d/radar_gauge_dataset_vertical_9500.pkl
+  dem: dem/preserve_dem_10m_utm.tif
+  patience: 20
+  epochs: 100
+  batch_size: 32
+  lr: 5.0e-5
+  base_filters: 64
+  no_sampler: true
+  # n_encoder_blocks: auto-selected from patch size if omitted
+  # (patch <=5 -> 1 for unet/2 for stack, patch <=9 -> 2/3, else 3/4)
+
+experiments:
+  # ----------------------------------------------------------------
+  # U-NET EXPERIMENTS
+  # ----------------------------------------------------------------
+
+  # radar filter
+
+  # ── 1a) Baseline: dualpol, no log, weighted_mae, no sampler ──
+  # - name: wmae_nolog_radarfilter_nosampler_dualpol_normal
+  #   model_type: unet
+  #   filter_mode: radar
+  #   features: dualpol
+  #   loss: weighted_mae
+  #   log_target: false
+  #   width: normal
+
+  # - name: mae_nolog_radarfilter_nosampler_dualpol_normal
+  #   model_type: unet
+  #   filter_mode: radar
+  #   features: dualpol
+  #   loss: mae
+  #   log_target: false
+  #   width: normal
+
+
+  # ── 1b) Add vertical features normal ──
+  # - name: wmae_nolog_radarfilter_nosampler_dualpolvert_normal
+  #   model_type: unet
+  #   filter_mode: radar
+  #   features: dualpol+vertical
+  #   loss: weighted_mae
+  #   log_target: false
+  #   width: normal
+  
+
+  # ── 1c) Add vertical features wide ──
+  # - name: wmae_nolog_radarfilter_nosampler_dualpolvert_wide
+  #   model_type: unet
+  #   filter_mode: radar
+  #   features: dualpol+vertical
+  #   loss: weighted_mae
+  #   log_target: false
+  #   width: wide
+
+
+  # - name: mae_nolog_radarfilter_nosampler_dualpolvert_wide
+  #   model_type: unet
+  #   filter_mode: radar
+  #   features: dualpol+vertical
+  #   loss: mae
+  #   log_target: false
+  #   width: wide
+  
+  # - name: huber_nolog_radarfilter_nosampler_dualpolvert_wide
+  #   model_type: unet
+  #   filter_mode: radar
+  #   features: dualpol+vertical
+  #   loss: huber
+  #   log_target: false
+  #   width: wide
+
+  # # ── 2a) Baseline: dualpol, with log, weighted_mae, no sampler ──
+  # - name: wmae_nlog_radarfilter_nosampler_dualpol_normal
+  #   model_type: unet
+  #   filter_mode: radar
+  #   features: dualpol
+  #   loss: weighted_mae
+  #   log_target: true
+  #   width: normal
+
+  # # ── 2b) Add vertical features normal ──
+  # - name: wmae_log_radarfilter_nosampler_dualpolvert_normal
+  #   model_type: unet
+  #   filter_mode: radar
+  #   features: dualpol+vertical
+  #   loss: weighted_mae
+  #   log_target: true
+  #   width: normal
+
+  # # ── 2c) Add vertical features wide ──
+  # - name: wmae_log_radarfilter_nosampler_dualpolvert_wide
+  #   model_type: unet
+  #   filter_mode: radar
+  #   features: dualpol+vertical
+  #   loss: weighted_mae
+  #   log_target: true
+  #   width: wide
+
+  # # blunt filter
+
+  # # ── 1a) Baseline: dualpol, no log, weighted_mae, no sampler ──
+  # - name: wmae_nolog_bluntfilter_nosampler_dualpol_normal
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: dualpol
+  #   loss: weighted_mae
+  #   log_target: false
+  #   width: normal
+
+  # # ── 1b) Add vertical features ──
+  # - name: wmae_nolog_bluntfilter_nosampler_dualpolvert_normal
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: dualpol+vertical
+  #   loss: weighted_mae
+  #   log_target: false
+  #   width: normal
+
+  #   # ── 1c) Add vertical features wide ──
+  # - name: wmae_nolog_bluntfilter_nosampler_dualpolvert_wide
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: dualpol+vertical
+  #   loss: weighted_mae
+  #   log_target: false
+  #   width: wide
+
+  #   # ── 1d) Add vertical features extra wide ──
+  # - name: wmae_nolog_bluntfilter_nosampler_dualpolvert_xwide
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: dualpol+vertical
+  #   loss: weighted_mae
+  #   log_target: false
+  #   width: extra_wide
+
+  # ── 2a) Baseline: dualpol, with log, weighted_mae, no sampler ──
+  # - name: wmae_log_bluntfilter_nosampler_dualpol_normal
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: dualpol
+  #   loss: weighted_mae
+  #   log_target: true
+  #   width: normal
+
+  # ── 2b) Add vertical features normal ──
+  - name: wmae_nolog_bluntfilter_nosampler_dualpolvert_normal
+    model_type: unet
+    filter_mode: blunt
+    features: dualpol+vertical
+    loss: weighted_mae
+    log_target: false
+    width: normal
+
+  # ── 2b) Add vertical features wide ──
+  - name: wmae_nolog_bluntfilter_nosampler_dualpolvert_wide
+    model_type: unet
+    filter_mode: blunt
+    features: dualpol+vertical
+    loss: weighted_mae
+    log_target: false
+    width: wide
+
+# ── 2c) Add vertical features extra wide ──
+  - name: wmae_nolog_bluntfilter_nosampler_dualpolvert_xwide
+    model_type: unet
+    filter_mode: blunt
+    features: dualpol+vertical
+    loss: weighted_mae
+    log_target: false
+    width: extra_wide
+

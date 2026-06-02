@@ -12,9 +12,10 @@ This project develops precipitation prediction models that map NEXRAD dual-polar
 - Limited by frozen backbone capacity and small effective receptive field
 
 ### Stack CNN (Hourly)
-- 3-block CNN encoder (192→384→512) with adaptive pooling
-- Processes 12 radar scans per hour (73 input channels: 4 fields×12 + masks + temporal position + DEM)
-- Scalar or spatial map output; trained with various loss functions
+- CNN encoder (192→384→512, configurable depth/width) processing 12 radar scans per hour
+- Input channels scale with feature selection (e.g. 133 channels for 9 fields×12 + mask + temporal position + DEM)
+- Originally used `AdaptiveAvgPool2d` → MLP decoder, which collapsed spatial structure and **hard-capped predictions**
+- A `SpatialConvHead` option (convolutional decoder, no global pooling) was added and **resolved the cap**, allowing the model to predict higher values; wide + spatial head gave the strongest Stack results
 - Best suited for structured experiment comparison
 
 ### Stack 10-min (Single Scan)
@@ -24,10 +25,11 @@ This project develops precipitation prediction models that map NEXRAD dual-polar
 - Valuable as a diagnostic tool for gauge quality analysis
 
 ### U-Net (Hourly) — Current Best
-- Encoder-decoder with skip connections, 64 base filters
-- Same 73-channel input as Stack CNN
-- Trained in raw mm-space with Huber/weighted MAE loss
-- Best daily test R² = 0.58 with optimized filtering
+- Encoder-decoder with skip connections; configurable depth (`n_encoder_blocks`) and width presets (`shallow`/`normal`/`wide`/`extra_wide`)
+- Input channels scale with feature selection (133 channels for the 9-field dual-pol + vertical set)
+- Trainable in raw mm-space or log-space; weighted MAE / Huber loss
+- Best daily test R² = 0.58–0.62 with optimized filtering
+- Now ingests the 9-field dual-pol + vertical-structure set; adding vertical features helped modestly
 
 ## Key Findings
 
@@ -80,26 +82,73 @@ The 10-min single-scan experiment confirmed:
 
 ### 6. Feature Importance (Ablation)
 
-From ablation studies, feature importance ranking:
-1. **Temporal position** — most critical (encodes scan ordering)
-2. **ZDR** (Differential Reflectivity) — strong precipitation signal
-3. **RhoHV** (Cross-correlation) — rain/hail discrimination
-4. **Validity mask** — tells model which scans are present
-5. **Reflectivity** — base signal
-6. **DEM** — minor contribution
-7. **KDP** — minimal impact with current normalization
+With the 9-field dual-pol + vertical set, ablation (ΔR² when removed) ranks:
+1. **Temporal position** — by far most critical (encodes scan ordering); removing it is catastrophic
+2. **Max Z Height** — now one of the strongest single features (vertical structure matters)
+3. **All dual-pol** (ZDR + RhoHV + KDP together) — large combined contribution
+4. **RhoHV** (Cross-correlation) — rain/phase discrimination
+5. **Validity mask** — tells model which scans are present
+6. **ZDR**, **Reflectivity**, **Low-level Ref** — moderate
+7. **DEM**, **VIL**, **Echo Top**, **Column Depth**, **KDP** — minor / near-zero individually
+
+The vertical features (esp. `max_z_height`) earned real importance, validating the decision to add them.
+
+### 7. Log-space vs. Raw mm-space
+
+- **Stack** trains noticeably better in **log-space**; the same architecture in raw mm-space underperformed.
+- **U-Net** differences between log and no-log are **modest** on validation R² (≈0.29–0.32 across normal/wide/xwide).
+- ⚠️ **Metric caveat**: `val_R²` printed during training is computed in whatever space the model trains in. A log-space `val_R²` is **not** directly comparable to the mm-space R² in the evaluation charts (log-space R² looks higher because the compression tames the heavy tail). Always compare models in the same space — the evaluation/test charts (mm-space) are the apples-to-apples number.
+
+### 8. Model Width
+
+- Width presets (`normal`/`wide`/`extra_wide`) were wired in for both architectures.
+- Wider was **not reliably better** for the U-Net — `extra_wide` sometimes scored *below* `wide` (e.g. val R² xwide 0.29 < wide 0.32), i.e. diminishing/negative returns and overfitting risk.
+- For the Stack, **wide + spatial head** was the most promising combination.
+
+### 9. Error Diagnostics: Two Distinct Failure Modes
+
+Detailed per-sample diagnostics (`diagnose_overestimates.py`, `diagnose_underestimates.py`, `diagnose_overpredict_weather.py`) revealed the model fails in two physically opposite regimes:
+
+**Overprediction (cold / bright-band) — small but clear:**
+- ~54 validation samples where pred ≥8 mm but actual <5 mm
+- Occur at **cold** surface temps (~6 °C), with **depressed RhoHV** (87% <0.97 vs 56% for correct), **low max-Z height** (~736 m), slightly elevated ZDR
+- Combined flag (RhoHV<0.97 AND max-Z<2500 m) → **4.5× higher** overprediction rate
+- Interpretation: **melting-layer / bright-band contamination** — on cold days the freezing level (and bright band) sits low, the radar over-reads reflectivity from melting hydrometeors, and the gauge catches less at the surface
+
+**Underprediction (warm / atmospheric-river) — the bigger problem:**
+- **68% of all heavy-rain hours (271/398, actual >5 mm) underpredicted by >25%**; median pred/actual ratio ≈ **0.40**
+- Pervasive across all 15 stations and 46 storm days, but with coherent multi-station AR events (e.g. confirmed atmospheric river on 2025-11-14)
+- Warm-rain signatures: **low reflectivity-per-rainrate** (3.97 vs 5.57 dBZ per mm/hr), **shallower echo tops** (3.8 vs 4.5 km), **lower ZDR** (small drops), **higher RhoHV** (pure liquid), slightly **warmer** surface temps (12.4 vs 11.6 °C)
+- The current KDP — collocated at the height of max reflectivity (often aloft) — pointed the "wrong" way, a strong hint that we are **measuring dual-pol at the wrong height** for surface QPE
+- Interpretation: **warm-rain / orographic (AR) underestimation** — shallow, small-drop, high-liquid rain that S-band Z–R systematically under-reads
+
+### 10. The Loss Function Is Still an Open Problem
+
+The heavy-rain low bias is too large and too broad (46 storm days, 68% of heavy rain) to be explained by physics/features alone — it is partly a **loss/optimization** issue:
+- `weighted_mae` up-weights large targets but the model still regresses toward the conditional mean on the rare heavy tail
+- Even perfect input features won't fix a loss that drives predictions to the middle of a heavy-tailed distribution
+- **This needs continued experimentation** independent of feature engineering: e.g. stronger target weighting, focal/quantile-style losses, importance sampling of heavy events, or a two-stage (detect-then-regress) approach. Sampler strategy and log-vs-mm interaction with the loss should be revisited too.
 
 ## Next Steps
 
-### Vertical Structure Features (In Progress)
-New zarr generation includes 5 derived 3D features computed before collapsing to 2D:
+### Vertical Structure Features — Phase 1 (Done)
+The first batch of 5 derived 3D features is already computed and in the model:
 - **Echo Top Height** — highest altitude with Z≥18 dBZ
 - **VIL** (Vertically Integrated Liquid) — total liquid content
-- **Max Z Height** — altitude of peak reflectivity
+- **Max Z Height** — altitude of peak reflectivity (became a top-ranked feature in ablation)
 - **Low-level Mean Reflectivity** — 0-2 km average
 - **Column Depth Fraction** — fraction of levels with Z>10 dBZ
 
-These should directly address the prediction cap by providing the physical information needed to distinguish shallow moderate rain from deep heavy rain at the same max dBZ.
+### Full 3D Volume + New Features — Phase 2 (In Progress)
+Driven directly by the diagnostics above, the radar pull (`radar/pull_nexrad_multi.py`) now stores the **full 3D volume** (22 Z levels × y × x for all 5 raw fields) instead of collapsing to 2D, and the **KDP `Z<20 dBZ` mask was removed** (it was deleting warm-rain signal at low reflectivity). A new offline step (`radar/derive_features.py`) collapses the 3D archive into the 2D feature zarr, so features can be iterated **without re-pulling from S3** (~2-day job).
+
+New features being derived to target the two failure modes:
+- *Warm-rain / orographic (underprediction):* **low-level KDP, low-level ZDR, low-level RhoHV** (0–2 km, near the surface rather than at max-Z), **lowest-gate reflectivity**, **beam height** (overshoot indicator), **vertical reflectivity gradient** (seeder-feeder)
+- *Bright band (overprediction):* **melting-layer height** (RhoHV-minimum height) and **RhoHV-min** value
+
+The 3D archive also future-proofs feature engineering: any new vertical metric can be derived offline without another S3 pull.
+
+> Note: features address *information content*, but the heavy-rain shortfall is also a **loss-function** problem (see Finding #10) — both fronts need work.
 
 ## File Structure
 
@@ -109,15 +158,24 @@ dataset/
   create_pickle_10min.py    # 10-min single-scan pickle
 
 models/
+  run_experiments.py        # Model-agnostic YAML-driven batch runner
   unet/                     # Current best model
-    train.py                # --filter-mode blunt|radar
-    evaluate.py             # Respects filter_mode from checkpoint
+    train.py                # --filter-mode blunt|radar, width presets, log/mm
+    evaluate.py             # Respects filter_mode/log_target from checkpoint
     ablation.py
-    diagnose_outliers.py    # Investigate extreme samples
-  stack/                    # Hourly CNN baseline
+    diagnose_overestimates.py        # Pred high, actual low
+    diagnose_overpredict_weather.py  # RH/temp/ZDR/elevation/bright-band
+    diagnose_underestimates.py       # Heavy rain underprediction (warm-rain/AR)
+    experiments.yaml
+  stack/                    # Hourly CNN baseline (+ SpatialConvHead option)
+    experiments.yaml
   stack_10min/              # 10-min temporal experiment
     diagnose_outliers.py    # Cross-station outlier analysis
   gfm/                      # Foundation model approach
+
+radar/
+  pull_nexrad_multi.py      # Now stores FULL 3D volume (no KDP mask)
+  derive_features.py        # Offline 3D → 2D feature derivation
 
 weather/
   pull_weather.py           # Now returns dump_ratio, max_bin_mm, n_active_bins

@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 from models.unet.model import PrecipUNet, init_weights
-from models.stack.dataset import RadarGaugeDataset
+from models.unet.dataset import RadarGaugeDataset, resolve_fields, compute_n_input_channels
 
 # ── DEFAULT CONFIG ────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = {
@@ -42,13 +42,14 @@ DEFAULT_CONFIG = {
 # ── LOSS ──────────────────────────────────────────────────────────────────────
 
 class GaugePixelLoss(nn.Module):
-    """Loss computed only at the gauge pixel location (operates in mm space)."""
+    """Loss computed only at the gauge pixel location."""
 
-    def __init__(self, max_precip=100.0, loss_type='mae', huber_delta=2.0):
+    def __init__(self, max_precip=100.0, loss_type='mae', huber_delta=2.0, log_target=False):
         super().__init__()
         self.max_precip = max_precip
         self.loss_type = loss_type
         self.huber_delta = huber_delta
+        self.log_target = log_target
 
     def forward(self, pred_map, target, gauge_pixel):
         batch_size = pred_map.shape[0]
@@ -73,7 +74,7 @@ class GaugePixelLoss(nn.Module):
             else:
                 pred_at_gauge = pred_map[:, 2, 2]
 
-        valid = (target >= 0) & (target < self.max_precip)
+        valid = (target >= 0) & (target < (np.log1p(self.max_precip) if self.log_target else self.max_precip))
         if valid.sum() == 0:
             return torch.tensor(0.0, device=pred_map.device, requires_grad=True)
 
@@ -87,10 +88,16 @@ class GaugePixelLoss(nn.Module):
         elif self.loss_type == 'huber':
             return F.smooth_l1_loss(pred_v, tgt_v, beta=self.huber_delta)
         elif self.loss_type == 'weighted_mae':
-            weights = 1.0 + tgt_v / 5.0
+            if self.log_target:
+                weights = 1.0 + tgt_v
+            else:
+                weights = 1.0 + tgt_v / 5.0
             return (weights * torch.abs(pred_v - tgt_v)).mean()
         elif self.loss_type == 'weighted_mae_sq':
-            weights = 1.0 + (tgt_v / 5.0) ** 2
+            if self.log_target:
+                weights = 1.0 + tgt_v ** 2
+            else:
+                weights = 1.0 + (tgt_v / 5.0) ** 2
             return (weights * torch.abs(pred_v - tgt_v)).mean()
         return torch.abs(pred_v - tgt_v).mean()
 
@@ -199,56 +206,73 @@ def filter_biased_extremes(samples):
     return filtered
 
 
-def filter_radar_unsupported(samples, precip_threshold=20.0):
+def filter_radar_unsupported(samples, precip_threshold=10.0):
     """
-    Remove high-precip samples where radar doesn't support the reading.
-    Physics-based replacement for station-name blanket filters.
-    
+    Remove samples where radar and gauge readings are physically inconsistent.
+    Physics-based replacement for blunt station-name/cap filters.
+
     Removes:
-    - ARTIFACT: precip >= threshold AND max_dbz < 25 (no radar support)
+    - ARTIFACT: precip >= threshold AND max_dbz < 25 (gauge reading with no radar support)
     - SUSPECT:  precip >= threshold AND max_dbz < 40 AND scans_above_30 < 3
-    
-    Keeps REAL and UNCLEAR (radar shows sustained/strong activity).
+    - MISMATCH: center-pixel max_dbz > 50 AND target < 2mm (strong radar directly
+                over gauge but near-zero reading → likely gauge malfunction)
+
+    Keeps cases where high reflectivity is at patch edges (spatial variability)
+    or aloft but not reaching the surface (virga — valuable for vertical feature learning).
     """
     filtered = []
     removed_artifact = 0
     removed_suspect = 0
+    removed_mismatch = 0
 
     for s in samples:
         target = s['hourly_precip_mm']
 
-        if target < precip_threshold:
-            filtered.append(s)
-            continue
-
         ref_data = s['radar_patch'][:, 0, :, :].copy()
         ref_data[ref_data == -9999.0] = np.nan
 
-        max_dbz = np.nanmax(ref_data)
-        if np.isnan(max_dbz):
-            max_dbz = 0.0
+        # Center pixel reflectivity (where the gauge is)
+        H, W = ref_data.shape[1], ref_data.shape[2]
+        cy, cx = H // 2, W // 2
+        center_ref = ref_data[:, cy, cx]
+        center_max_dbz = np.nanmax(center_ref)
+        if np.isnan(center_max_dbz):
+            center_max_dbz = 0.0
 
-        radar_indices = s.get('radar_indices', [None] * 12)
-        valid_scans = [i for i, idx in enumerate(radar_indices) if idx is not None]
-        scans_above_30 = 0
-        for scan_i in valid_scans:
-            scan_max = np.nanmax(ref_data[scan_i])
-            if not np.isnan(scan_max) and scan_max > 30:
-                scans_above_30 += 1
+        # Strong radar directly over gauge but near-zero reading
+        if center_max_dbz > 50 and target < 2.0:
+            removed_mismatch += 1
+            continue
 
-        if max_dbz < 25:
-            removed_artifact += 1
-            continue
-        elif max_dbz < 40 and scans_above_30 < 3:
-            removed_suspect += 1
-            continue
+        # Only apply radar-support checks above the precip threshold
+        if target >= precip_threshold:
+            max_dbz = np.nanmax(ref_data)
+            if np.isnan(max_dbz):
+                max_dbz = 0.0
+
+            radar_indices = s.get('radar_indices', [None] * 12)
+            valid_scans = [i for i, idx in enumerate(radar_indices) if idx is not None]
+            scans_above_30 = 0
+            for scan_i in valid_scans:
+                scan_max = np.nanmax(ref_data[scan_i])
+                if not np.isnan(scan_max) and scan_max > 30:
+                    scans_above_30 += 1
+
+            if max_dbz < 25:
+                removed_artifact += 1
+                continue
+            elif max_dbz < 40 and scans_above_30 < 3:
+                removed_suspect += 1
+                # continue
 
         filtered.append(s)
 
-    removed = removed_artifact + removed_suspect
+    removed = removed_artifact + removed_mismatch
     print(f"✓ filter_radar_unsupported: removed {removed} "
-          f"(artifact={removed_artifact}, suspect={removed_suspect}) "
-          f"from {precip_threshold}+ mm/hr samples")
+          f"(artifact={removed_artifact}, mismatch={removed_mismatch}) "
+          f"from precip>={precip_threshold}mm samples")
+    print(f"Kept suspect={removed_suspect}")
+          
     return filtered
 
 
@@ -361,14 +385,14 @@ def filter_gauge_dumps(samples, dump_ratio_threshold=0.95, precip_threshold=5.0)
 
 # ── TRAINING ──────────────────────────────────────────────────────────────────
 
-def train_epoch(model, dataloader, criterion, optimizer, device):
+def train_epoch(model, dataloader, criterion, optimizer, device, log_target=True):
     model.train()
     total_loss = 0
     n_batches = 0
 
     for batch in tqdm(dataloader, desc="Train", leave=False):
         radar = batch['radar'].to(device)
-        target = torch.expm1(batch['target']).to(device)
+        target = batch['target'].to(device)
         gauge_pixel = batch['gauge_pixel']
         bias_flag = batch.get('bias_flag')
 
@@ -393,7 +417,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
     return total_loss / max(n_batches, 1)
 
 
-def validate(model, dataloader, criterion, device):
+def validate(model, dataloader, criterion, device, log_target=True):
     model.eval()
     total_loss = 0
     n_batches = 0
@@ -402,7 +426,7 @@ def validate(model, dataloader, criterion, device):
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Val", leave=False):
             radar = batch['radar'].to(device)
-            target = torch.expm1(batch['target']).to(device)
+            target = batch['target'].to(device)
             gauge_pixel = batch['gauge_pixel']
             bias_flag = batch.get('bias_flag')
 
@@ -439,7 +463,7 @@ def validate(model, dataloader, criterion, device):
     preds = torch.cat(all_preds).numpy()
     targets = torch.cat(all_targets).numpy()
 
-    # R² in mm space
+    # R² in training space (log if log_target, mm otherwise)
     ss_res = np.sum((targets - preds) ** 2)
     ss_tot = np.sum((targets - targets.mean()) ** 2)
     r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float('nan')
@@ -466,9 +490,18 @@ def save_config(run_dir, cfg, n_params, train_samples, val_samples, model):
         if isinstance(module, nn.Conv2d) and 'enc' in name:
             encoder_channels.append(module.out_channels)
 
+    fields = resolve_fields(cfg.get('fields'))
+
     config_data = {
         'timestamp': datetime.now().isoformat(),
         'model_type': 'unet',
+        # Feature configuration
+        'fields': fields,
+        'use_dem': cfg.get('use_dem', True),
+        'use_mask': cfg.get('use_mask', True),
+        'use_temporal_pos': cfg.get('use_temporal_pos', True),
+        'log_target': cfg.get('log_target', True),
+        # Training params
         'loss_type': cfg.get('loss_type', 'mae'),
         'lr': cfg.get('lr'),
         'weight_decay': cfg.get('weight_decay'),
@@ -476,13 +509,23 @@ def save_config(run_dir, cfg, n_params, train_samples, val_samples, model):
         'patience': cfg.get('patience'),
         'max_epochs': cfg.get('max_epochs'),
         'base_filters': cfg.get('base_filters', 64),
+        'width_preset': cfg.get('width_preset', 'normal'),
+        'dropout_rate': cfg.get('dropout_rate', 0.15),
+        # Data
         'pickle_path': cfg.get('pickle_path'),
         'dem_path': cfg.get('dem_path'),
+        'filter_mode': cfg.get('filter_mode', 'blunt'),
+        'sampler_type': cfg.get('sampler_type', 'moderate'),
+        'no_sampler': cfg.get('no_sampler', False),
+        'exclude_stations': cfg.get('exclude_stations', []),
+        # Model info
         'n_parameters': n_params,
-        'n_input_channels': RadarGaugeDataset.n_input_channels(),
-        'fields_used': RadarGaugeDataset.FIELDS,
+        'n_input_channels': compute_n_input_channels(
+            fields, cfg.get('use_mask', True),
+            cfg.get('use_temporal_pos', True), cfg.get('use_dem', True)
+        ),
+        'n_encoder_blocks': cfg.get('n_encoder_blocks', 3),
         'encoder_channels': encoder_channels,
-        'dropout_rate': cfg.get('dropout_rate', 0.15),
         'input_size': f"{cfg.get('output_size', 19)}x{cfg.get('output_size', 19)}",
         'output_size': cfg.get('output_size', 19),
         'train_samples_after_filter': train_samples,
@@ -511,8 +554,16 @@ def train(cfg: dict = None, run_name: str = None):
     print(f"{'='*60}\n")
 
     # Data
-    train_ds = RadarGaugeDataset(cfg['pickle_path'], dem_path=cfg['dem_path'], split='train', augment=True, aug_prob=0.5)
-    val_ds = RadarGaugeDataset(cfg['pickle_path'], dem_path=cfg['dem_path'], split='val', augment=False)
+    ds_kwargs = dict(
+        dem_path=cfg['dem_path'],
+        fields=cfg.get('fields'),
+        use_dem=cfg.get('use_dem', True),
+        use_mask=cfg.get('use_mask', True),
+        use_temporal_pos=cfg.get('use_temporal_pos', True),
+        log_target=cfg.get('log_target', True),
+    )
+    train_ds = RadarGaugeDataset(cfg['pickle_path'], split='train', augment=True, aug_prob=0.5, **ds_kwargs)
+    val_ds = RadarGaugeDataset(cfg['pickle_path'], split='val', augment=False, **ds_kwargs)
 
     # Apply filters
     exclude = cfg.get('exclude_stations', [])
@@ -541,6 +592,15 @@ def train(cfg: dict = None, run_name: str = None):
 
     print(f"\nAfter filtering — Train: {len(train_ds.samples)}, Val: {len(val_ds.samples)}")
 
+    # Precip distribution diagnostic
+    for split_name, ds in [('Train', train_ds), ('Val', val_ds)]:
+        targets = [s['hourly_precip_mm'] for s in ds.samples]
+        bins = [(0, 1), (1, 5), (5, 10), (10, 20), (20, 40), (40, 60), (60, float('inf'))]
+        counts = [sum(1 for t in targets if lo <= t < hi) for lo, hi in bins]
+        labels = ['0-1', '1-5', '5-10', '10-20', '20-40', '40-60', '60+']
+        print(f"  {split_name} precip distribution (mm/hr):")
+        print(f"    {'  '.join(f'{l}:{c}' for l, c in zip(labels, counts))}")
+
     if cfg.get('no_sampler', False):
         print("  Using uniform sampling (no weighted sampler)")
         train_loader = DataLoader(train_ds, batch_size=cfg['batch_size'], shuffle=True, num_workers=0, pin_memory=True)
@@ -552,9 +612,23 @@ def train(cfg: dict = None, run_name: str = None):
     # Model
     patch_pixels = train_ds.samples[0]['radar_patch'].shape[-1]
     cfg['output_size'] = patch_pixels
+
+    # Auto-select encoder depth based on patch size if not specified
+    n_encoder_blocks = cfg.get('n_encoder_blocks')
+    if n_encoder_blocks is None:
+        if patch_pixels <= 5:
+            n_encoder_blocks = 1
+        elif patch_pixels <= 9:
+            n_encoder_blocks = 2
+        else:
+            n_encoder_blocks = 3
+    cfg['n_encoder_blocks'] = n_encoder_blocks
+
     model = PrecipUNet(
+        in_channels=train_ds.n_channels,
         base_filters=cfg.get('base_filters', 64),
         dropout_rate=cfg.get('dropout_rate', 0.15),
+        n_encoder_blocks=n_encoder_blocks,
     ).to(device)
     model.apply(init_weights)
 
@@ -563,7 +637,8 @@ def train(cfg: dict = None, run_name: str = None):
 
     save_config(run_dir, cfg, n_params, len(train_ds.samples), len(val_ds.samples), model)
 
-    criterion = GaugePixelLoss(max_precip=cfg['max_precip'], loss_type=cfg['loss_type'])
+    criterion = GaugePixelLoss(max_precip=cfg['max_precip'], loss_type=cfg['loss_type'],
+                               log_target=cfg.get('log_target', True))
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
@@ -572,9 +647,11 @@ def train(cfg: dict = None, run_name: str = None):
     patience_counter = 0
     best_ckpt_path = None
 
+    log_target = cfg.get('log_target', True)
+
     for epoch in range(1, cfg['max_epochs'] + 1):
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_r2 = validate(model, val_loader, criterion, device)
+        train_loss = train_epoch(model, train_loader, criterion, optimizer, device, log_target=log_target)
+        val_loss, val_r2 = validate(model, val_loader, criterion, device, log_target=log_target)
         scheduler.step(val_loss)
 
         lr_now = optimizer.param_groups[0]['lr']

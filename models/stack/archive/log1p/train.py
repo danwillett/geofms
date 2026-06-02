@@ -19,8 +19,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 from models.stack.model import PrecipitationStackModel, init_weights
-from models.unet.dataset import RadarGaugeDataset, resolve_fields, compute_n_input_channels
-from models.unet.train import filter_radar_unsupported
+from models.stack.dataset import RadarGaugeDataset
 
 # ── DEFAULT CONFIG ────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = {
@@ -391,15 +390,13 @@ def create_run_dir(base_dir, run_name=None):
 
 def save_config(run_dir, cfg, n_params, train_samples, val_samples, model):
     """Save experiment configuration to config.json in the run directory."""
+    from models.stack.model import RadarEncoder, PrecipitationDecoder
+
     encoder = model.radar_encoder
     encoder_channels = []
     for name, module in encoder.named_modules():
         if isinstance(module, nn.Conv2d) and 'conv' in name:
             encoder_channels.append(module.out_channels)
-
-    fields = cfg.get('fields', resolve_fields(None))
-    if isinstance(fields, str):
-        fields = resolve_fields(fields)
 
     config_data = {
         'timestamp': datetime.now().isoformat(),
@@ -413,20 +410,11 @@ def save_config(run_dir, cfg, n_params, train_samples, val_samples, model):
         'add_bias': cfg.get('add_bias'),
         'pickle_path': cfg.get('pickle_path'),
         'dem_path': cfg.get('dem_path'),
-        'fields': fields,
-        'use_dem': cfg.get('use_dem', True),
-        'use_mask': cfg.get('use_mask', True),
-        'use_temporal_pos': cfg.get('use_temporal_pos', True),
-        'log_target': cfg.get('log_target', True),
         'n_parameters': n_params,
-        'n_input_channels': compute_n_input_channels(
-            fields, cfg.get('use_mask', True),
-            cfg.get('use_temporal_pos', True), cfg.get('use_dem', True)
-        ),
-        'n_encoder_blocks': cfg.get('n_encoder_blocks', 3),
-        'spatial_head': cfg.get('spatial_head', False),
+        'n_input_channels': RadarGaugeDataset.n_input_channels(),
+        'fields_used': RadarGaugeDataset.FIELDS,
         'encoder_channels': encoder_channels,
-        'decoder_hidden_dim': getattr(model.decoder, 'fc1', None) and model.decoder.fc1.out_features,
+        'decoder_hidden_dim': model.decoder.fc1.out_features,
         'dropout_rate': cfg.get('dropout_rate', 0.25),
         'input_size': f'{model.decoder.output_size}x{model.decoder.output_size}',
         'output_size': model.decoder.output_size,
@@ -456,50 +444,25 @@ def train(cfg: dict = None, run_name: str = None):
     print(f"{'='*60}\n")
 
     # Data
-    # Data
-    ds_kwargs = dict(
-        dem_path=cfg['dem_path'],
-        fields=cfg.get('fields'),
-        use_dem=cfg.get('use_dem', True),
-        use_mask=cfg.get('use_mask', True),
-        use_temporal_pos=cfg.get('use_temporal_pos', True),
-        log_target=cfg.get('log_target', True),
-    )
-    train_ds = RadarGaugeDataset(cfg['pickle_path'], split='train', augment=True, aug_prob=0.5, **ds_kwargs)
-    val_ds = RadarGaugeDataset(cfg['pickle_path'], split='val', augment=False, **ds_kwargs)
+    train_ds = RadarGaugeDataset(cfg['pickle_path'], dem_path=cfg['dem_path'], split='train', augment=True, aug_prob=0.5)
+    val_ds = RadarGaugeDataset(cfg['pickle_path'], dem_path=cfg['dem_path'], split='val', augment=False)
 
     # Apply filters
     exclude = cfg.get('exclude_stations', [])
-    filter_mode = cfg.get('filter_mode', 'blunt')
     train_ds.samples = filter_stations(train_ds.samples, exclude)
     train_ds.samples = filter_nan_radar(train_ds.samples)
-    if filter_mode == 'radar':
-        train_ds.samples = filter_radar_unsupported(train_ds.samples)
-    else:
-        train_ds.samples = filter_biased_extremes(train_ds.samples)
-        train_ds.samples = filter_bad_samples(train_ds.samples)
+    train_ds.samples = filter_biased_extremes(train_ds.samples)
+    train_ds.samples = filter_bad_samples(train_ds.samples)
     train_ds.samples = filter_suspect_station_days(train_ds.samples)
     train_ds.samples = filter_gauge_dumps(train_ds.samples)
     val_ds.samples = filter_stations(val_ds.samples, exclude)
     val_ds.samples = filter_nan_radar(val_ds.samples)
-    if filter_mode == 'radar':
-        val_ds.samples = filter_radar_unsupported(val_ds.samples)
-    else:
-        val_ds.samples = filter_biased_extremes(val_ds.samples)
-        val_ds.samples = filter_bad_samples(val_ds.samples)
+    val_ds.samples = filter_biased_extremes(val_ds.samples)
+    val_ds.samples = filter_bad_samples(val_ds.samples)
     val_ds.samples = filter_suspect_station_days(val_ds.samples)
     val_ds.samples = filter_gauge_dumps(val_ds.samples)
 
     print(f"\nAfter filtering — Train: {len(train_ds.samples)}, Val: {len(val_ds.samples)}")
-
-    # Precip distribution diagnostic
-    for split_name, ds in [('Train', train_ds), ('Val', val_ds)]:
-        targets = [s['hourly_precip_mm'] for s in ds.samples]
-        bins = [(0, 1), (1, 5), (5, 10), (10, 20), (20, 40), (40, 60), (60, float('inf'))]
-        counts = [sum(1 for t in targets if lo <= t < hi) for lo, hi in bins]
-        labels = ['0-1', '1-5', '5-10', '10-20', '20-40', '40-60', '60+']
-        print(f"  {split_name} precip distribution (mm/hr):")
-        print(f"    {'  '.join(f'{l}:{c}' for l, c in zip(labels, counts))}")
 
     if cfg.get('no_sampler', False):
         print("  Using uniform sampling (no weighted sampler)")
@@ -512,26 +475,11 @@ def train(cfg: dict = None, run_name: str = None):
     # Model
     patch_pixels = train_ds.samples[0]['radar_patch'].shape[-1]
     cfg['output_size'] = patch_pixels
-
-    # Auto-select encoder depth based on patch size if not specified
-    n_encoder_blocks = cfg.get('n_encoder_blocks')
-    if n_encoder_blocks is None:
-        if patch_pixels <= 5:
-            n_encoder_blocks = 2
-        elif patch_pixels <= 9:
-            n_encoder_blocks = 3
-        else:
-            n_encoder_blocks = 4
-    cfg['n_encoder_blocks'] = n_encoder_blocks
-
     model = PrecipitationStackModel(
-        in_channels=train_ds.n_channels,
         latent_dim=cfg['latent_dim'],
         add_bias=cfg['add_bias'],
         output_size=patch_pixels,
         scalar_output=cfg.get('scalar_output', False),
-        n_encoder_blocks=n_encoder_blocks,
-        spatial_head=cfg.get('spatial_head', False),
     ).to(device)
     model.apply(init_weights)
 

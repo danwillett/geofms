@@ -12,43 +12,43 @@ import argparse
 import json
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from datetime import datetime
 from pathlib import Path
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
-from models.stack.model import PrecipitationStackModel, init_weights
-from models.unet.dataset import RadarGaugeDataset, resolve_fields, compute_n_input_channels
-from models.unet.train import filter_radar_unsupported
+from models.unet.model import PrecipUNet, init_weights
+from models.stack.dataset import RadarGaugeDataset
 
 # ── DEFAULT CONFIG ────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = {
-    'pickle_path':    'dataset/outputs/radar_gauge_dataset.pkl',
+    'pickle_path':    'dataset/outputs/radar_gauge_dataset_with_offsets_9500.pkl',
     'dem_path':       'dem/preserve_dem_10m_utm.tif',
-    'checkpoint_dir': 'checkpoints/stack_dualpol',
+    'checkpoint_dir': 'models/checkpoints/unet_dualpol',
     'lr':             5e-5,
     'weight_decay':   1e-4,
     'max_epochs':     100,
     'batch_size':     32,
     'patience':       20,
-    'latent_dim':     512,
+    'base_filters':   64,
     'add_bias':       False,
     'loss_type':      'mae',
     'max_precip':     100.0,
-    'scalar_output':  False,
 }
 
 
 # ── LOSS ──────────────────────────────────────────────────────────────────────
 
 class GaugePixelLoss(nn.Module):
-    """Loss computed only at the gauge pixel location."""
+    """Loss computed only at the gauge pixel location (operates in mm space)."""
 
-    def __init__(self, max_precip=100.0, loss_type='mae'):
+    def __init__(self, max_precip=100.0, loss_type='mae', huber_delta=2.0):
         super().__init__()
         self.max_precip = max_precip
         self.loss_type = loss_type
+        self.huber_delta = huber_delta
 
     def forward(self, pred_map, target, gauge_pixel):
         batch_size = pred_map.shape[0]
@@ -73,7 +73,7 @@ class GaugePixelLoss(nn.Module):
             else:
                 pred_at_gauge = pred_map[:, 2, 2]
 
-        valid = (target >= 0) & (target < np.log1p(self.max_precip))
+        valid = (target >= 0) & (target < self.max_precip)
         if valid.sum() == 0:
             return torch.tensor(0.0, device=pred_map.device, requires_grad=True)
 
@@ -84,14 +84,18 @@ class GaugePixelLoss(nn.Module):
             return torch.abs(pred_v - tgt_v).mean()
         elif self.loss_type == 'mse':
             return ((pred_v - tgt_v) ** 2).mean()
+        elif self.loss_type == 'huber':
+            return F.smooth_l1_loss(pred_v, tgt_v, beta=self.huber_delta)
         elif self.loss_type == 'weighted_mae':
-            weights = 1.0 + tgt_v
+            weights = 1.0 + tgt_v / 5.0
             return (weights * torch.abs(pred_v - tgt_v)).mean()
         elif self.loss_type == 'weighted_mae_sq':
-            weights = 1.0 + tgt_v ** 2
+            weights = 1.0 + (tgt_v / 5.0) ** 2
             return (weights * torch.abs(pred_v - tgt_v)).mean()
         return torch.abs(pred_v - tgt_v).mean()
 
+
+# ── SAMPLER ───────────────────────────────────────────────────────────────────
 
 # ── SAMPLER ───────────────────────────────────────────────────────────────────
 
@@ -195,6 +199,59 @@ def filter_biased_extremes(samples):
     return filtered
 
 
+def filter_radar_unsupported(samples, precip_threshold=20.0):
+    """
+    Remove high-precip samples where radar doesn't support the reading.
+    Physics-based replacement for station-name blanket filters.
+    
+    Removes:
+    - ARTIFACT: precip >= threshold AND max_dbz < 25 (no radar support)
+    - SUSPECT:  precip >= threshold AND max_dbz < 40 AND scans_above_30 < 3
+    
+    Keeps REAL and UNCLEAR (radar shows sustained/strong activity).
+    """
+    filtered = []
+    removed_artifact = 0
+    removed_suspect = 0
+
+    for s in samples:
+        target = s['hourly_precip_mm']
+
+        if target < precip_threshold:
+            filtered.append(s)
+            continue
+
+        ref_data = s['radar_patch'][:, 0, :, :].copy()
+        ref_data[ref_data == -9999.0] = np.nan
+
+        max_dbz = np.nanmax(ref_data)
+        if np.isnan(max_dbz):
+            max_dbz = 0.0
+
+        radar_indices = s.get('radar_indices', [None] * 12)
+        valid_scans = [i for i, idx in enumerate(radar_indices) if idx is not None]
+        scans_above_30 = 0
+        for scan_i in valid_scans:
+            scan_max = np.nanmax(ref_data[scan_i])
+            if not np.isnan(scan_max) and scan_max > 30:
+                scans_above_30 += 1
+
+        if max_dbz < 25:
+            removed_artifact += 1
+            continue
+        elif max_dbz < 40 and scans_above_30 < 3:
+            removed_suspect += 1
+            continue
+
+        filtered.append(s)
+
+    removed = removed_artifact + removed_suspect
+    print(f"✓ filter_radar_unsupported: removed {removed} "
+          f"(artifact={removed_artifact}, suspect={removed_suspect}) "
+          f"from {precip_threshold}+ mm/hr samples")
+    return filtered
+
+
 def filter_suspect_station_days(samples):
     """Remove samples from station-days where the gauge read zero but others had rain."""
     daily_totals = {}
@@ -245,15 +302,23 @@ def filter_gauge_dumps(samples, dump_ratio_threshold=0.95, precip_threshold=5.0)
     Remove samples where most of the hourly rainfall came from a single 10-min bin
     AND other stations don't corroborate heavy rain at the same time.
     
+    A sample is removed only if ALL conditions are met:
+    - precip >= precip_threshold
+    - dump_ratio >= dump_ratio_threshold (rain concentrated in one bin)
+    - No other station reports >= 30% of this station's precip in the same hour
+    
     Requires 'dump_ratio' field in samples (added during pickle creation).
+    Samples without the field are kept (backward compatibility).
     """
     from collections import defaultdict
 
+    # Check if any samples have the field
     has_field = any('dump_ratio' in s for s in samples)
     if not has_field:
-        print(f"✓ filter_gauge_dumps: skipped (no 'dump_ratio' field — regenerate pickle to enable)")
+        print(f"✓ filter_gauge_dumps: skipped (no 'dump_ratio' field in pickle — regenerate pickle to enable)")
         return samples
 
+    # Build timestamp lookup for cross-station check
     by_hour = defaultdict(list)
     for s in samples:
         by_hour[s['hour_start']].append(s)
@@ -269,10 +334,12 @@ def filter_gauge_dumps(samples, dump_ratio_threshold=0.95, precip_threshold=5.0)
         target = s['hourly_precip_mm']
         dump_ratio = s['dump_ratio']
 
+        # Only consider high-precip, high-concentration samples
         if target < precip_threshold or dump_ratio < dump_ratio_threshold:
             filtered.append(s)
             continue
 
+        # Check if other stations corroborate
         same_hour = by_hour[s['hour_start']]
         other_precip = [x['hourly_precip_mm'] for x in same_hour
                         if x['station_id'] != s['station_id']]
@@ -281,8 +348,10 @@ def filter_gauge_dumps(samples, dump_ratio_threshold=0.95, precip_threshold=5.0)
         others_confirm = any(p >= corroboration_threshold for p in other_precip)
 
         if others_confirm:
+            # Other stations show significant rain too — likely real burst
             filtered.append(s)
         else:
+            # Isolated spike with dump signature — likely artifact
             removed_count += 1
 
     print(f"✓ filter_gauge_dumps: removed {removed_count} "
@@ -299,7 +368,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
 
     for batch in tqdm(dataloader, desc="Train", leave=False):
         radar = batch['radar'].to(device)
-        target = batch['target'].to(device)
+        target = torch.expm1(batch['target']).to(device)
         gauge_pixel = batch['gauge_pixel']
         bias_flag = batch.get('bias_flag')
 
@@ -333,7 +402,7 @@ def validate(model, dataloader, criterion, device):
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Val", leave=False):
             radar = batch['radar'].to(device)
-            target = batch['target'].to(device)
+            target = torch.expm1(batch['target']).to(device)
             gauge_pixel = batch['gauge_pixel']
             bias_flag = batch.get('bias_flag')
 
@@ -370,7 +439,7 @@ def validate(model, dataloader, criterion, device):
     preds = torch.cat(all_preds).numpy()
     targets = torch.cat(all_targets).numpy()
 
-    # R² in log space
+    # R² in mm space
     ss_res = np.sum((targets - preds) ** 2)
     ss_tot = np.sum((targets - targets.mean()) ** 2)
     r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float('nan')
@@ -391,45 +460,31 @@ def create_run_dir(base_dir, run_name=None):
 
 def save_config(run_dir, cfg, n_params, train_samples, val_samples, model):
     """Save experiment configuration to config.json in the run directory."""
-    encoder = model.radar_encoder
-    encoder_channels = []
-    for name, module in encoder.named_modules():
-        if isinstance(module, nn.Conv2d) and 'conv' in name:
-            encoder_channels.append(module.out_channels)
 
-    fields = cfg.get('fields', resolve_fields(None))
-    if isinstance(fields, str):
-        fields = resolve_fields(fields)
+    encoder_channels = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d) and 'enc' in name:
+            encoder_channels.append(module.out_channels)
 
     config_data = {
         'timestamp': datetime.now().isoformat(),
+        'model_type': 'unet',
         'loss_type': cfg.get('loss_type', 'mae'),
         'lr': cfg.get('lr'),
         'weight_decay': cfg.get('weight_decay'),
         'batch_size': cfg.get('batch_size'),
         'patience': cfg.get('patience'),
         'max_epochs': cfg.get('max_epochs'),
-        'latent_dim': cfg.get('latent_dim'),
-        'add_bias': cfg.get('add_bias'),
+        'base_filters': cfg.get('base_filters', 64),
         'pickle_path': cfg.get('pickle_path'),
         'dem_path': cfg.get('dem_path'),
-        'fields': fields,
-        'use_dem': cfg.get('use_dem', True),
-        'use_mask': cfg.get('use_mask', True),
-        'use_temporal_pos': cfg.get('use_temporal_pos', True),
-        'log_target': cfg.get('log_target', True),
         'n_parameters': n_params,
-        'n_input_channels': compute_n_input_channels(
-            fields, cfg.get('use_mask', True),
-            cfg.get('use_temporal_pos', True), cfg.get('use_dem', True)
-        ),
-        'n_encoder_blocks': cfg.get('n_encoder_blocks', 3),
-        'spatial_head': cfg.get('spatial_head', False),
+        'n_input_channels': RadarGaugeDataset.n_input_channels(),
+        'fields_used': RadarGaugeDataset.FIELDS,
         'encoder_channels': encoder_channels,
-        'decoder_hidden_dim': getattr(model.decoder, 'fc1', None) and model.decoder.fc1.out_features,
-        'dropout_rate': cfg.get('dropout_rate', 0.25),
-        'input_size': f'{model.decoder.output_size}x{model.decoder.output_size}',
-        'output_size': model.decoder.output_size,
+        'dropout_rate': cfg.get('dropout_rate', 0.15),
+        'input_size': f"{cfg.get('output_size', 19)}x{cfg.get('output_size', 19)}",
+        'output_size': cfg.get('output_size', 19),
         'train_samples_after_filter': train_samples,
         'val_samples_after_filter': val_samples,
     }
@@ -456,21 +511,14 @@ def train(cfg: dict = None, run_name: str = None):
     print(f"{'='*60}\n")
 
     # Data
-    # Data
-    ds_kwargs = dict(
-        dem_path=cfg['dem_path'],
-        fields=cfg.get('fields'),
-        use_dem=cfg.get('use_dem', True),
-        use_mask=cfg.get('use_mask', True),
-        use_temporal_pos=cfg.get('use_temporal_pos', True),
-        log_target=cfg.get('log_target', True),
-    )
-    train_ds = RadarGaugeDataset(cfg['pickle_path'], split='train', augment=True, aug_prob=0.5, **ds_kwargs)
-    val_ds = RadarGaugeDataset(cfg['pickle_path'], split='val', augment=False, **ds_kwargs)
+    train_ds = RadarGaugeDataset(cfg['pickle_path'], dem_path=cfg['dem_path'], split='train', augment=True, aug_prob=0.5)
+    val_ds = RadarGaugeDataset(cfg['pickle_path'], dem_path=cfg['dem_path'], split='val', augment=False)
 
     # Apply filters
     exclude = cfg.get('exclude_stations', [])
     filter_mode = cfg.get('filter_mode', 'blunt')
+    print(f"  Filter mode: {filter_mode}")
+
     train_ds.samples = filter_stations(train_ds.samples, exclude)
     train_ds.samples = filter_nan_radar(train_ds.samples)
     if filter_mode == 'radar':
@@ -480,6 +528,7 @@ def train(cfg: dict = None, run_name: str = None):
         train_ds.samples = filter_bad_samples(train_ds.samples)
     train_ds.samples = filter_suspect_station_days(train_ds.samples)
     train_ds.samples = filter_gauge_dumps(train_ds.samples)
+
     val_ds.samples = filter_stations(val_ds.samples, exclude)
     val_ds.samples = filter_nan_radar(val_ds.samples)
     if filter_mode == 'radar':
@@ -492,15 +541,6 @@ def train(cfg: dict = None, run_name: str = None):
 
     print(f"\nAfter filtering — Train: {len(train_ds.samples)}, Val: {len(val_ds.samples)}")
 
-    # Precip distribution diagnostic
-    for split_name, ds in [('Train', train_ds), ('Val', val_ds)]:
-        targets = [s['hourly_precip_mm'] for s in ds.samples]
-        bins = [(0, 1), (1, 5), (5, 10), (10, 20), (20, 40), (40, 60), (60, float('inf'))]
-        counts = [sum(1 for t in targets if lo <= t < hi) for lo, hi in bins]
-        labels = ['0-1', '1-5', '5-10', '10-20', '20-40', '40-60', '60+']
-        print(f"  {split_name} precip distribution (mm/hr):")
-        print(f"    {'  '.join(f'{l}:{c}' for l, c in zip(labels, counts))}")
-
     if cfg.get('no_sampler', False):
         print("  Using uniform sampling (no weighted sampler)")
         train_loader = DataLoader(train_ds, batch_size=cfg['batch_size'], shuffle=True, num_workers=0, pin_memory=True)
@@ -512,26 +552,9 @@ def train(cfg: dict = None, run_name: str = None):
     # Model
     patch_pixels = train_ds.samples[0]['radar_patch'].shape[-1]
     cfg['output_size'] = patch_pixels
-
-    # Auto-select encoder depth based on patch size if not specified
-    n_encoder_blocks = cfg.get('n_encoder_blocks')
-    if n_encoder_blocks is None:
-        if patch_pixels <= 5:
-            n_encoder_blocks = 2
-        elif patch_pixels <= 9:
-            n_encoder_blocks = 3
-        else:
-            n_encoder_blocks = 4
-    cfg['n_encoder_blocks'] = n_encoder_blocks
-
-    model = PrecipitationStackModel(
-        in_channels=train_ds.n_channels,
-        latent_dim=cfg['latent_dim'],
-        add_bias=cfg['add_bias'],
-        output_size=patch_pixels,
-        scalar_output=cfg.get('scalar_output', False),
-        n_encoder_blocks=n_encoder_blocks,
-        spatial_head=cfg.get('spatial_head', False),
+    model = PrecipUNet(
+        base_filters=cfg.get('base_filters', 64),
+        dropout_rate=cfg.get('dropout_rate', 0.15),
     ).to(device)
     model.apply(init_weights)
 
@@ -611,13 +634,14 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=DEFAULT_CONFIG['max_epochs'])
     parser.add_argument('--batch-size', type=int, default=DEFAULT_CONFIG['batch_size'])
     parser.add_argument('--patience', type=int, default=DEFAULT_CONFIG['patience'])
-    parser.add_argument('--loss', choices=['mae', 'mse', 'weighted_mae', 'weighted_mae_sq'], default=DEFAULT_CONFIG['loss_type'])
-    parser.add_argument('--add-bias', action='store_true')
+    parser.add_argument('--base-filters', type=int, default=DEFAULT_CONFIG['base_filters'])
+    parser.add_argument('--loss', choices=['mae', 'mse', 'huber', 'weighted_mae', 'weighted_mae_sq'], default=DEFAULT_CONFIG['loss_type'])
     parser.add_argument('--no-sampler', action='store_true', help='Disable weighted sampler (use uniform sampling)')
     parser.add_argument('--sampler-type', choices=['light', 'moderate', 'heavy'], default='moderate',
                         help='Sampler intensity preset (default: moderate)')
-    parser.add_argument('--scalar-output', action='store_true', help='Predict single scalar instead of spatial map')
     parser.add_argument('--exclude-stations', nargs='+', default=[], help='Station names to exclude (e.g. Dangermond_Bunker_Hill)')
+    parser.add_argument('--filter-mode', choices=['blunt', 'radar'], default='blunt',
+                        help='Filter mode: blunt (station-based caps) or radar (physics-based)')
     parser.add_argument('--run-name', default=None, help='Short description suffix for the run folder')
     args = parser.parse_args()
 
@@ -629,11 +653,11 @@ if __name__ == '__main__':
     cfg['max_epochs'] = args.epochs
     cfg['batch_size'] = args.batch_size
     cfg['patience'] = args.patience
+    cfg['base_filters'] = args.base_filters
     cfg['loss_type'] = args.loss
-    cfg['add_bias'] = args.add_bias
     cfg['no_sampler'] = args.no_sampler
     cfg['sampler_type'] = args.sampler_type
-    cfg['scalar_output'] = args.scalar_output
     cfg['exclude_stations'] = args.exclude_stations
+    cfg['filter_mode'] = args.filter_mode
 
     train(cfg, run_name=args.run_name)

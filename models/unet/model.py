@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.stack.dataset import RadarGaugeDataset
-
 
 class ConvBlock(nn.Module):
     """Two conv layers with BatchNorm and ReLU."""
@@ -27,68 +25,71 @@ class ConvBlock(nn.Module):
 class PrecipUNet(nn.Module):
     """
     U-Net for precipitation estimation from dual-pol radar + DEM.
-    Preserves spatial correspondence via skip connections.
-    Outputs a spatial precipitation map at the same resolution as input.
+    Dynamic depth: n_encoder_blocks controls the number of encoder/decoder stages.
+    Automatically adapts to input spatial size.
+
+    Recommended settings:
+      patch 5x5  -> n_encoder_blocks=1
+      patch 9x9  -> n_encoder_blocks=2
+      patch 19x19 -> n_encoder_blocks=3
     """
 
-    def __init__(self, in_channels=None, base_filters=64, dropout_rate=0.15):
+    def __init__(self, in_channels=133, base_filters=64, dropout_rate=0.15, n_encoder_blocks=None):
         super().__init__()
-        if in_channels is None:
-            in_channels = RadarGaugeDataset.n_input_channels()
+        self.add_bias = False
+
+        # Auto-detect depth if not specified (default 3 for backward compat)
+        if n_encoder_blocks is None:
+            n_encoder_blocks = 3
+        self.n_encoder_blocks = n_encoder_blocks
 
         f = base_filters
 
-        # Encoder
-        self.enc1 = ConvBlock(in_channels, f, dropout_rate)
-        self.pool1 = nn.MaxPool2d(2)
-
-        self.enc2 = ConvBlock(f, f * 2, dropout_rate)
-        self.pool2 = nn.MaxPool2d(2)
-
-        self.enc3 = ConvBlock(f * 2, f * 4, dropout_rate)
-        self.pool3 = nn.MaxPool2d(2)
+        # Build encoder blocks dynamically
+        self.encoders = nn.ModuleList()
+        self.pools = nn.ModuleList()
+        prev_ch = in_channels
+        for i in range(n_encoder_blocks):
+            out_ch = f * (2 ** i)
+            self.encoders.append(ConvBlock(prev_ch, out_ch, dropout_rate))
+            self.pools.append(nn.MaxPool2d(2))
+            prev_ch = out_ch
 
         # Bottleneck
-        self.bottleneck = ConvBlock(f * 4, f * 8, dropout_rate)
+        bottleneck_ch = f * (2 ** n_encoder_blocks)
+        self.bottleneck = ConvBlock(prev_ch, bottleneck_ch, dropout_rate)
 
-        # Decoder
-        self.up3 = nn.ConvTranspose2d(f * 8, f * 4, kernel_size=2, stride=2)
-        self.dec3 = ConvBlock(f * 8, f * 4, dropout_rate)
+        # Build decoder blocks (reverse order)
+        self.upconvs = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        prev_ch = bottleneck_ch
+        for i in range(n_encoder_blocks - 1, -1, -1):
+            enc_ch = f * (2 ** i)
+            self.upconvs.append(nn.ConvTranspose2d(prev_ch, enc_ch, kernel_size=2, stride=2))
+            self.decoders.append(ConvBlock(enc_ch * 2, enc_ch, dropout_rate))
+            prev_ch = enc_ch
 
-        self.up2 = nn.ConvTranspose2d(f * 4, f * 2, kernel_size=2, stride=2)
-        self.dec2 = ConvBlock(f * 4, f * 2, dropout_rate)
-
-        self.up1 = nn.ConvTranspose2d(f * 2, f, kernel_size=2, stride=2)
-        self.dec1 = ConvBlock(f * 2, f, dropout_rate)
-
-        # Output head: single channel precipitation
-        self.out_conv = nn.Conv2d(f, 1, kernel_size=1)
-
-        self.add_bias = False
+        # Output head
+        self.out_conv = nn.Conv2d(prev_ch, 1, kernel_size=1)
 
     def forward(self, x, bias_flag=None):
         # Encoder
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool1(e1))
-        e3 = self.enc3(self.pool2(e2))
+        enc_features = []
+        for encoder, pool in zip(self.encoders, self.pools):
+            x = encoder(x)
+            enc_features.append(x)
+            x = pool(x)
 
         # Bottleneck
-        b = self.bottleneck(self.pool3(e3))
+        x = self.bottleneck(x)
 
         # Decoder with skip connections
-        d3 = self.up3(b)
-        d3 = F.interpolate(d3, size=e3.shape[2:], mode='bilinear', align_corners=False)
-        d3 = self.dec3(torch.cat([d3, e3], dim=1))
+        for upconv, decoder, skip in zip(self.upconvs, self.decoders, reversed(enc_features)):
+            x = upconv(x)
+            x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
+            x = decoder(torch.cat([x, skip], dim=1))
 
-        d2 = self.up2(d3)
-        d2 = F.interpolate(d2, size=e2.shape[2:], mode='bilinear', align_corners=False)
-        d2 = self.dec2(torch.cat([d2, e2], dim=1))
-
-        d1 = self.up1(d2)
-        d1 = F.interpolate(d1, size=e1.shape[2:], mode='bilinear', align_corners=False)
-        d1 = self.dec1(torch.cat([d1, e1], dim=1))
-
-        out = self.out_conv(d1).squeeze(1)  # (B, H, W)
+        out = self.out_conv(x).squeeze(1)  # (B, H, W)
         return out
 
 
