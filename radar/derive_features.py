@@ -6,15 +6,24 @@ The radar pull (radar/pull_nexrad_multi.py) now stores the FULL 3D volume
 model-ready 2D feature zarr (time, y, x), so feature engineering can be
 iterated WITHOUT re-pulling from S3 (which takes ~2 days).
 
-It reproduces the legacy 10 features exactly (so it is a drop-in replacement
-for the old 2D zarr) and adds new vertical-structure features motivated by the
+It reproduces the legacy 10 features (drop-in replacement for the old 2D zarr),
+with one deliberate change: height features (echo_top_height, max_z_height,
+melting_layer_height) now fill no-echo pixels with NaN instead of 0.0, so that
+"no echo" is distinguishable from "low height" and can drive a validity mask
+downstream. It also adds new vertical-structure features motivated by the
 over/under-prediction diagnostics:
 
-  Low-level (warm-rain / orographic):
+  Low-level (warm-rain / orographic) — fixed 0–2 km (legacy, unchanged):
     low_level_kdp, low_level_zdr, low_level_rhohv,
     lowest_gate_reflectivity, beam_height, vertical_reflectivity_gradient
+  Sub-melting-layer (dynamic liquid column):
+    subml_rhohv, subml_zdr, subml_kdp, subml_ref_max, subml_zdr_gradient
+    Uses gates below the melting layer when a credible bright band is detected;
+    otherwise falls back to beam_height → min(2 km, echo top).
   Melting layer / bright band (cold over-read):
-    melting_layer_height, rhohv_min
+    melting_layer_height, rhohv_min,
+    bright_band_ref, bright_band_drop, maxz_meltlayer_offset,
+    bright_band_intensity
 
 Output schema matches what dataset/create_pickle.py expects: data_vars with
 dims (time, y, x), coords time/x/y, and per-field 'crs' attrs.
@@ -43,9 +52,9 @@ RAW_FIELDS = [
     'specific_differential_phase',
 ]
 
-# Output field order. First 10 are the legacy schema (drop-in compatible);
-# the rest are new and become available to the model once registered in
-# models/unet/dataset.py (held off for now).
+# Output field order. First 21 entries are the legacy schema (drop-in compatible);
+# subml_* fields are appended so existing pickles/checkpoints keep channel alignment
+# when trained without them.
 OUTPUT_FIELDS = [
     # legacy
     'reflectivity',
@@ -58,17 +67,87 @@ OUTPUT_FIELDS = [
     'vil',
     'low_level_ref',
     'column_depth_fraction',
-    # new — low-level / warm-rain
+    # fixed 0–2 km low-level / warm-rain (legacy)
     'low_level_kdp',
     'low_level_zdr',
     'low_level_rhohv',
     'lowest_gate_reflectivity',
     'beam_height',
     'vertical_reflectivity_gradient',
-    # new — melting layer / bright band
+    # melting layer / bright band
     'melting_layer_height',
     'rhohv_min',
+    'bright_band_ref',
+    'bright_band_drop',
+    'maxz_meltlayer_offset',
+    'bright_band_intensity',
+    # sub-melting-layer liquid column (dynamic or warm-rain fallback)
+    'subml_rhohv',
+    'subml_zdr',
+    'subml_kdp',
+    'subml_ref_max',
+    'subml_zdr_gradient',
 ]
+
+# Bright-band credibility thresholds for sub-ML dynamic sampling.
+SUBML_RHOHV_MAX = 0.95
+SUBML_ML_MIN_HEIGHT_M = 500.0
+WARM_RAIN_CAP_M = 2000.0
+
+
+def _layer_stat(arr3d, mask3d, stat='mean'):
+    """Reduce arr3d (nz, ny, nx) over axis 0 where mask3d is True."""
+    masked = np.where(mask3d, arr3d, np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', category=RuntimeWarning)
+        if stat == 'mean':
+            return np.nanmean(masked, axis=0)
+        if stat == 'max':
+            return np.nanmax(masked, axis=0)
+        raise ValueError(f"Unknown stat: {stat}")
+
+
+def _fixed_low_mean(arr3d, low_mask):
+    """Legacy fixed 0–2 km column mean."""
+    if not low_mask.any():
+        return np.full(arr3d.shape[1:], np.nan, dtype=float)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', category=RuntimeWarning)
+        return np.nanmean(arr3d[low_mask, :, :], axis=0)
+
+
+def _build_liquid_layer_mask(
+    z_heights,
+    valid,
+    beam_height,
+    echo_top_height,
+    melting_layer_height,
+    rhohv_min,
+    has_any,
+    z_res,
+):
+    """
+    Per-column 3D mask for the liquid rain layer.
+
+    When a credible bright band is present: beam_height <= z < melting_layer_height.
+    Otherwise (warm rain / shallow columns): beam_height <= z <= min(2 km, echo top).
+    """
+    z3 = z_heights[:, None, None]
+    beam = beam_height[None, :, :]
+    ml_h = melting_layer_height[None, :, :]
+    cap = np.minimum(WARM_RAIN_CAP_M, echo_top_height)[None, :, :]
+
+    below_ml = valid & (z3 < ml_h) & (z3 >= beam)
+    fallback = valid & (z3 >= beam) & (z3 <= cap)
+
+    bb_present = (
+        has_any
+        & np.isfinite(rhohv_min) & (rhohv_min < SUBML_RHOHV_MAX)
+        & np.isfinite(melting_layer_height) & (melting_layer_height > SUBML_ML_MIN_HEIGHT_M)
+        & np.isfinite(beam_height) & (melting_layer_height > beam_height + z_res)
+    )
+    liquid_mask = np.where(bb_present[None, :, :], below_ml, fallback)
+    return liquid_mask, bb_present
 
 
 def compute_features(vol, z_heights):
@@ -94,16 +173,16 @@ def compute_features(vol, z_heights):
     echo_mask = ref_3d >= 18.0
     has_echo = np.any(echo_mask, axis=0)
     echo_top_idx = nz_grid - 1 - np.argmax(echo_mask[::-1, :, :], axis=0)
-    out['echo_top_height'] = np.where(has_echo, z_heights[echo_top_idx], 0.0)
+    out['echo_top_height'] = np.where(has_echo, z_heights[echo_top_idx], np.nan)
 
     max_z_height = z_heights[z_idx]
-    out['max_z_height'] = np.where(np.isfinite(out['reflectivity']), max_z_height, 0.0)
+    out['max_z_height'] = np.where(np.isfinite(out['reflectivity']), max_z_height, np.nan)
 
     ref_linear = 10.0 ** (ref_3d / 10.0)
     ref_linear = np.where(np.isfinite(ref_linear), ref_linear, 0.0)
     out['vil'] = 3.44e-6 * np.nansum(ref_linear ** (4.0 / 7.0) * z_res, axis=0)
 
-    low_mask = z_heights <= 2000.0
+    low_mask = z_heights <= WARM_RAIN_CAP_M
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', category=RuntimeWarning)
         if low_mask.any():
@@ -121,43 +200,75 @@ def compute_features(vol, z_heights):
             continue
         out[field_name] = vol[field_name][z_idx, yy, xx]
 
-    # ── New features ──
+    # ── Shared validity / beam geometry ──
     valid = np.isfinite(ref_3d)
     has_any = valid.any(axis=0)
 
-    # Lowest valid gate (surface-proximate) reflectivity and its height.
-    first_idx = np.argmax(valid, axis=0)  # first True per column (0 if none)
+    first_idx = np.argmax(valid, axis=0)
     out['lowest_gate_reflectivity'] = np.where(has_any, ref_3d[first_idx, yy, xx], np.nan)
     out['beam_height'] = np.where(has_any, z_heights[first_idx], np.nan)
 
-    # Low-level (0-2km) dual-pol means — warm-rain discriminators.
+    # Low-level (0–2 km) dual-pol means — legacy warm-rain discriminators (unchanged).
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', category=RuntimeWarning)
-        def _low_mean(arr3d):
-            if not low_mask.any():
-                return np.full((ny, nx), np.nan, dtype=float)
-            return np.nanmean(arr3d[low_mask, :, :], axis=0)
-        out['low_level_kdp'] = _low_mean(vol['specific_differential_phase'])
-        out['low_level_zdr'] = _low_mean(vol['differential_reflectivity'])
-        out['low_level_rhohv'] = _low_mean(vol['cross_correlation_ratio'])
+        out['low_level_kdp'] = _fixed_low_mean(vol['specific_differential_phase'], low_mask)
+        out['low_level_zdr'] = _fixed_low_mean(vol['differential_reflectivity'], low_mask)
+        out['low_level_rhohv'] = _fixed_low_mean(vol['cross_correlation_ratio'], low_mask)
 
-        # Vertical reflectivity gradient: low-level minus mid-level (2-4km).
-        mid_mask = (z_heights > 2000.0) & (z_heights <= 4000.0)
+        mid_mask = (z_heights > WARM_RAIN_CAP_M) & (z_heights <= 4000.0)
         if mid_mask.any():
             mid_ref = np.nanmean(ref_3d[mid_mask, :, :], axis=0)
         else:
             mid_ref = np.full((ny, nx), np.nan, dtype=float)
         out['vertical_reflectivity_gradient'] = out['low_level_ref'] - mid_ref
 
-    # Melting layer / bright band: height of the RhoHV minimum within the
-    # precip column, and the minimum value itself. Use +inf fill for non-echo
-    # levels so argmin/min ignore them without nan-reduction errors.
+    # ── Melting layer / bright band ──
     rhohv_3d = vol['cross_correlation_ratio']
     rh_filled = np.where(valid & np.isfinite(rhohv_3d), rhohv_3d, np.inf)
     ml_idx = np.argmin(rh_filled, axis=0)
     rh_min = np.min(rh_filled, axis=0)
-    out['melting_layer_height'] = np.where(has_any, z_heights[ml_idx], 0.0)
+    out['melting_layer_height'] = np.where(has_any, z_heights[ml_idx], np.nan)
     out['rhohv_min'] = np.where(np.isfinite(rh_min) & has_any, rh_min, np.nan)
+
+    # ── Sub-melting-layer liquid column (new; legacy fields above unchanged) ──
+    liquid_mask, _bb_present = _build_liquid_layer_mask(
+        z_heights, valid, out['beam_height'], out['echo_top_height'],
+        out['melting_layer_height'], out['rhohv_min'], has_any, z_res,
+    )
+    has_liquid = liquid_mask.any(axis=0)
+
+    zdr_3d = vol['differential_reflectivity']
+    kdp_3d = vol['specific_differential_phase']
+
+    subml_rhohv = _layer_stat(rhohv_3d, liquid_mask, 'mean')
+    subml_zdr = _layer_stat(zdr_3d, liquid_mask, 'mean')
+    subml_kdp = _layer_stat(kdp_3d, liquid_mask, 'mean')
+    subml_ref_max = _layer_stat(ref_3d, liquid_mask, 'max')
+
+    idx_below_ml = np.maximum(ml_idx - 1, 0)
+    zdr_below_ml = zdr_3d[idx_below_ml, yy, xx]
+    subml_zdr_gradient = zdr_below_ml - subml_zdr
+
+    out['subml_rhohv'] = np.where(has_liquid, subml_rhohv, np.nan)
+    out['subml_zdr'] = np.where(has_liquid, subml_zdr, np.nan)
+    out['subml_kdp'] = np.where(has_liquid, subml_kdp, np.nan)
+    out['subml_ref_max'] = np.where(has_liquid, subml_ref_max, np.nan)
+    out['subml_zdr_gradient'] = np.where(has_liquid, subml_zdr_gradient, np.nan)
+
+    # ── Bright-band vertical structure (legacy) ──
+    bb_ref = ref_3d[ml_idx, yy, xx]
+    out['bright_band_ref'] = np.where(has_any, bb_ref, np.nan)
+
+    out['bright_band_drop'] = np.where(
+        has_any, bb_ref - out['lowest_gate_reflectivity'], np.nan)
+
+    out['maxz_meltlayer_offset'] = np.where(
+        has_any, z_heights[z_idx] - z_heights[ml_idx], np.nan)
+
+    idx_above = np.minimum(ml_idx + 1, nz_grid - 1)
+    ref_above = ref_3d[idx_above, yy, xx]
+    out['bright_band_intensity'] = np.where(
+        has_any & np.isfinite(ref_above), bb_ref - ref_above, np.nan)
 
     return out
 
@@ -187,7 +298,6 @@ def derive_features(input_zarr, output_zarr, batch_size=200):
         batch = ds3[RAW_FIELDS].isel(time=slice(b0, b1)).load()
         nb = b1 - b0
 
-        # Accumulate features for the batch: field -> (nb, ny, nx)
         acc = {f: np.empty((nb, len(y_vals), len(x_vals)), dtype=np.float32)
                for f in OUTPUT_FIELDS}
 
@@ -231,7 +341,6 @@ def main():
 
     output = args.output
     if output is None:
-        # Default: replace "dualpol_3d" -> "dualpol_feat" in the input name.
         inp = Path(args.input)
         output = str(inp.with_name(inp.name.replace('dualpol_3d', 'dualpol_feat')))
         if output == args.input:

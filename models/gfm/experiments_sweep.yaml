@@ -1,0 +1,68 @@
+# TerraMind / GFM sweep on the daygroup+offsets pickle.
+#
+# Primary axis: output_size (spatial context fed to the ViT)
+#   The pickle stores 19×19 patches (9500 m @ 500 m/px).
+#   output_size controls how large a window is cropped before upscaling to 256×256:
+#     5  →  2.5 km × 2.5 km  (matches original GFM training context)
+#     9  →  4.5 km × 4.5 km  (same as old 9×9 pickle; default)
+#     13 →  6.5 km × 6.5 km
+#     19 →  9.5 km × 9.5 km  (full patch, no crop — maximum spatial context)
+#
+# Secondary axes (held at output_size=9 baseline):
+#   - Sampler on/off
+#   - Log-space target
+#
+# Run:
+#   python -m models.gfm.train                             # single baseline run
+#   # Individual sweep runs (each takes ~30–90 min depending on GPU):
+#   python -m models.gfm.train --output-size 5  --ckpt-dir models/checkpoints/terramind_dualpol/ctx5
+#   python -m models.gfm.train --output-size 9  --ckpt-dir models/checkpoints/terramind_dualpol/ctx9
+#   python -m models.gfm.train --output-size 13 --ckpt-dir models/checkpoints/terramind_dualpol/ctx13
+#   python -m models.gfm.train --output-size 19 --ckpt-dir models/checkpoints/terramind_dualpol/ctx19
+#   python -m models.gfm.train --output-size 9 --no-sampler --ckpt-dir models/checkpoints/terramind_dualpol/ctx9_nosampler
+#
+# Note: GFM training uses PyTorch Lightning + TerraTorch, not run_experiments.py.
+# This YAML is a reference spec; runs are launched via the CLI above.
+# W&B logging is enabled automatically if WANDB_API_KEY is set in .env.
+
+sweep:
+  pickle: dataset/outputs/3d/radar_gauge_dataset_subml_daygroup_offsets_9500.pkl
+  dem: dem/preserve_dem_10m_utm.tif
+  lr: 1.0e-5
+  epochs: 100
+  batch_size: 8
+  patience: 20
+  use_feature_masks: true
+
+experiments:
+  # ── Spatial context (primary axis) ──────────────────────────────────────
+  - name: ctx5_sampler
+    output_size: 5
+    no_sampler: false
+    notes: "Smallest context — matches original GFM training; baseline for spatial ablation"
+
+  - name: ctx9_sampler
+    output_size: 9
+    no_sampler: false
+    notes: "4.5 km context — same as old 9x9 pickle; default recommended starting point"
+
+  - name: ctx13_sampler
+    output_size: 13
+    no_sampler: false
+    notes: "6.5 km context — captures 1-2 ridge widths, useful for orographic cases"
+
+  - name: ctx19_sampler
+    output_size: 19
+    no_sampler: false
+    notes: "Full 9.5 km patch — maximum spatial context, no crop; tests if wider view helps"
+
+  # ── Sampler off at best context (tests sampler effect in GFM) ───────────
+  - name: ctx9_nosampler
+    output_size: 9
+    no_sampler: true
+    notes: "Same as ctx9 but without heavy-rain oversampler — isolates sampler contribution"
+
+  - name: ctx19_nosampler
+    output_size: 19
+    no_sampler: true
+    notes: "Full context without sampler — cleanest test of pure spatial context value"

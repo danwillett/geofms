@@ -4,9 +4,9 @@
 # Subset:   python -m models.run_experiments models/unet/experiments.yaml --only unet_dualpol_raw
 
 base:
-  pickle: dataset/outputs/3d/radar_gauge_dataset_vertical_9500.pkl
+  pickle: dataset/outputs/3d/radar_gauge_dataset_vertlowmeltbb_9500.pkl
   dem: dem/preserve_dem_10m_utm.tif
-  patience: 20
+  patience: 15
   epochs: 100
   batch_size: 32
   lr: 5.0e-5
@@ -150,30 +150,541 @@ experiments:
   #   log_target: true
   #   width: normal
 
-  # ── 2b) Add vertical features normal ──
-  - name: wmae_nolog_bluntfilter_nosampler_dualpolvert_normal
-    model_type: unet
-    filter_mode: blunt
-    features: dualpol+vertical
-    loss: weighted_mae
-    log_target: false
-    width: normal
+  # ----------------------------------------------------------------
+  # BRIGHT-BAND vertical structure — adds the relational features that flag
+  # whether the column-max reflectivity is itself bright-band-contaminated
+  # (bright_band_ref/drop/intensity + maxz_meltlayer_offset). Built on the
+  # best-known pattern: blunt filter, weighted_mae, no sampler, raw mm-space,
+  # wide. The two configs differ only in use_feature_masks. Directly comparable
+  # to the prior dpvertlowmelt_wide_featmask run (same set + brightband).
+  # ----------------------------------------------------------------
 
-  # ── 2b) Add vertical features wide ──
-  - name: wmae_nolog_bluntfilter_nosampler_dualpolvert_wide
-    model_type: unet
-    filter_mode: blunt
-    features: dualpol+vertical
-    loss: weighted_mae
-    log_target: false
-    width: wide
+  # ── A) Full feature set + bright band, WITH feature masks (DONE) ──
+  # - name: wmae_nolog_bluntfilter_nosampler_dpvertlowmeltbb_wide_featmask
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: weighted_mae
+  #   log_target: false
+  #   width: wide
+  #   use_feature_masks: true
 
-# ── 2c) Add vertical features extra wide ──
-  - name: wmae_nolog_bluntfilter_nosampler_dualpolvert_xwide
+  # ── B) Full feature set + bright band, NO feature masks (DONE) ──
+  # - name: wmae_nolog_bluntfilter_nosampler_dpvertlowmeltbb_wide_nomask
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: weighted_mae
+  #   log_target: false
+  #   width: wide
+  #   use_feature_masks: false
+
+  # ----------------------------------------------------------------
+  # LOSS / SAMPLER — attack the heavy-rain under-bias. All hold the new best
+  # feature baseline fixed (bright-band feature set, featmask, blunt, nolog,
+  # wide) and vary only the loss/sampler so the effect is isolated.
+  #   asym_mae / asym_huber penalize underprediction (tgt>pred) by under_weight,
+  #   shifting the model to a higher CONDITIONAL quantile (lifts heavy rain
+  #   without globally inflating dry/light cases the way the sampler did).
+  # ----------------------------------------------------------------
+
+  # ── 1) Asymmetric MAE (≈0.67 quantile), no sampler ──
+  # - name: asymmae_nolog_bluntfilter_nosampler_dpvertlowmeltbb_wide_featmask
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 2.0
+  #   log_target: false
+  #   width: wide
+  #   use_feature_masks: true
+
+  # # ── 2) Asymmetric Huber (outlier-robust), no sampler ──
+  # - name: asymhuber_nolog_bluntfilter_nosampler_dpvertlowmeltbb_wide_featmask
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_huber
+  #   under_weight: 2.0
+  #   log_target: false
+  #   width: wide
+  #   use_feature_masks: true
+
+  # # ── 3) Asymmetric MAE + heavy sampler — retest the floor-raising concern
+  # #      now that bright-band features control over-reads ──
+  # - name: asymmae_nolog_bluntfilter_heavysampler_dpvertlowmeltbb_wide_featmask
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 2.0
+  #   log_target: false
+  #   width: wide
+  #   use_feature_masks: true
+  #   no_sampler: false
+  #   sampler_type: heavy
+
+  # # ----------------------------------------------------------------
+  # # UNDER_WEIGHT SWEEP — same 3 loss/sampler configs as above, varying the
+  # # underprediction penalty (1.5 = gentler / ~0.60 quantile, 2.5 = stronger /
+  # # ~0.71 quantile) to bracket the 2.0 runs and find the calibration sweet spot.
+  # # ----------------------------------------------------------------
+
+  # # ── 1) Asymmetric MAE, no sampler ──
+  # - name: asymmae_nolog_bluntfilter_nosampler_dpvertlowmeltbb_wide_featmask_uw15
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 1.5
+  #   log_target: false
+  #   width: wide
+  #   use_feature_masks: true
+
+  # - name: asymmae_nolog_bluntfilter_nosampler_dpvertlowmeltbb_wide_featmask_uw25
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 2.5
+  #   log_target: false
+  #   width: wide
+  #   use_feature_masks: true
+
+  # # ── 2) Asymmetric Huber, no sampler ──
+  # - name: asymhuber_nolog_bluntfilter_nosampler_dpvertlowmeltbb_wide_featmask_uw15
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_huber
+  #   under_weight: 1.5
+  #   log_target: false
+  #   width: wide
+  #   use_feature_masks: true
+
+  # - name: asymhuber_nolog_bluntfilter_nosampler_dpvertlowmeltbb_wide_featmask_uw25
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_huber
+  #   under_weight: 2.5
+  #   log_target: false
+  #   width: wide
+  #   use_feature_masks: true
+
+  # ── 3) Asymmetric MAE + heavy sampler ──
+  # - name: asymmae_nolog_bluntfilter_heavysampler_dpvertlowmeltbb_wide_featmask_uw15
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 1.5
+  #   log_target: false
+  #   width: wide
+  #   use_feature_masks: true
+  #   no_sampler: false
+  #   sampler_type: heavy
+
+  # - name: asymmae_nolog_bluntfilter_heavysampler_dpvertlowmeltbb_wide_featmask_uw25
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 2.5
+  #   log_target: false
+  #   width: wide
+  #   use_feature_masks: true
+  #   no_sampler: false
+  #   sampler_type: heavy
+
+# No DEM!
+# ── 1) Asymmetric MAE, no sampler ──
+  # - name: asymmae_nolog_bluntfilter_nosampler_dpvertlowmeltbb_wide_featmask_uw15
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 1.5
+  #   log_target: false
+  #   width: wide
+  #   use_feature_masks: true
+  #   use_dem: true
+
+  # - name: asymmae_nolog_bluntfilter_nosampler_dpvertlowmeltbb_xwide_featmask_uw15
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 1.5
+  #   log_target: false
+  #   width: extra_wide
+  #   use_feature_masks: true
+  #   use_dem: true
+
+  # - name: asymmae_nolog_bluntfilter_nosampler_dpvertlowmeltbb_xwide_featmask_uw2
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 2
+  #   log_target: false
+  #   width: extra_wide
+  #   use_feature_masks: true
+  #   use_dem: true
+
+  # - name: asymmae_nolog_bluntfilter_nosampler_dpvertlowmeltbb_wide_featmask_uw25
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 2.5
+  #   log_target: false
+  #   width: wide
+  #   use_feature_masks: true
+  #   use_dem: true
+
+  # - name: asymmae_nolog_bluntfilter_nosampler_dpvertlowmeltbb_xwide_featmask_uw25
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 2.5
+  #   log_target: false
+  #   width: extra_wide
+  #   use_feature_masks: true
+  #   use_dem: true
+
+  # - name: asymmae_log_bluntfilter_nosampler_dpvertlowmeltbb_xwide_featmask_uw2
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 2
+  #   log_target: true
+  #   width: extra_wide
+  #   use_feature_masks: true
+  #   use_dem: true
+
+  # - name: asymmae_log_bluntfilter_lightsampler_dpvertlowmeltbb_xwide_featmask_uw2
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 2
+  #   log_target: true
+  #   width: extra_wide
+  #   use_feature_masks: true
+  #   use_dem: true
+  #   no_sampler: false
+  #   sampler_type: light
+
+
+  # ----------------------------------------------------------------
+  # Next experiments — xwide/xxwide + uw2.0 (2026-06-06 best setup)
+  # Reference baseline: 2026-06-06_02-52 (val R² 0.406, xwide full features)
+  # ----------------------------------------------------------------
+
+  # - name: asymmae_nolog_bluntfilter_nosampler_dpvertlowmeltbb_xxwide_featmask_uw2
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 2
+  #   log_target: false
+  #   width: extra_extra_wide
+  #   use_feature_masks: true
+  #   use_dem: true
+
+  # - name: asymmae_nolog_bluntfilter_nosampler_allfeat_xwide_featmask_uw2
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: all
+  #   loss: asym_mae
+  #   under_weight: 2
+  #   log_target: false
+  #   width: extra_wide
+  #   use_feature_masks: true
+  #   use_dem: true
+
+  # - name: asymmae_nolog_bluntfilter_nosampler_allfeat_xxwide_featmask_uw2
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: all
+  #   loss: asym_mae
+  #   under_weight: 2
+  #   log_target: false
+  #   width: extra_extra_wide
+  #   use_feature_masks: true
+  #   use_dem: true
+
+  # ----------------------------------------------------------------
+  # SUB-ML LIQUID COLUMN — new pickle with subml_* features (derive_features
+  # re-run + create_pickle). Reference baseline: 2026-06-06_02-52
+  # (asym_mae uw2, xwide, blunt, nolog, featmask, full legacy feature set).
+  #
+  # Prerequisite pickle (adjust path after create_pickle):
+  #   dataset/outputs/3d/radar_gauge_dataset_subml_9500.pkl
+  #
+  # Experiments:
+  #   0) Same legacy features on new pickle — sanity check for regen
+  #   1) Replace lowlevel preset with subml; keep vertical (incl fixed low_level_ref)
+  #   2) Full replace — subml_* instead of low_level_kdp/zdr/rhohv and
+  #      subml_ref_max instead of low_level_ref (closest to design intent)
+  #   3) uw1.5 bracket on full replace
+  # ----------------------------------------------------------------
+
+  # - name: asymmae_nolog_bluntfilter_nosampler_dpvertlowmeltbb_xwide_featmask_uw2_submlpkl
+  #   model_type: unet
+  #   pickle: dataset/outputs/3d/radar_gauge_dataset_subml_9500.pkl
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 2
+  #   log_target: false
+  #   width: extra_wide
+  #   use_feature_masks: true
+  #   use_dem: true
+
+  # - name: asymmae_nolog_bluntfilter_nosampler_dpvertsubml_xwide_featmask_uw2
+  #   model_type: unet
+  #   pickle: dataset/outputs/3d/radar_gauge_dataset_subml_9500.pkl
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, subml, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 2
+  #   log_target: false
+  #   width: extra_wide
+  #   use_feature_masks: true
+  #   use_dem: true
+
+  # - name: asymmae_nolog_bluntfilter_nosampler_dpsubmlrepl_xwide_featmask_uw2
+  #   model_type: unet
+  #   pickle: dataset/outputs/3d/radar_gauge_dataset_subml_9500.pkl
+  #   filter_mode: blunt
+  #   features:
+  #     - reflectivity
+  #     - differential_reflectivity
+  #     - cross_correlation_ratio
+  #     - specific_differential_phase
+  #     - echo_top_height
+  #     - max_z_height
+  #     - vil
+  #     - subml_ref_max
+  #     - column_depth_fraction
+  #     - subml_rhohv
+  #     - subml_zdr
+  #     - subml_kdp
+  #     - subml_zdr_gradient
+  #     - lowest_gate_reflectivity
+  #     - beam_height
+  #     - vertical_reflectivity_gradient
+  #     - melting_layer_height
+  #     - rhohv_min
+  #     - bright_band_ref
+  #     - bright_band_drop
+  #     - maxz_meltlayer_offset
+  #     - bright_band_intensity
+  #   loss: asym_mae
+  #   under_weight: 2
+  #   log_target: false
+  #   width: extra_wide
+  #   use_feature_masks: true
+  #   use_dem: true
+
+  # - name: asymmae_nolog_bluntfilter_nosampler_dpsubmlrepl_xwide_featmask_uw15
+  #   model_type: unet
+  #   pickle: dataset/outputs/3d/radar_gauge_dataset_subml_9500.pkl
+  #   filter_mode: blunt
+  #   features:
+  #     - reflectivity
+  #     - differential_reflectivity
+  #     - cross_correlation_ratio
+  #     - specific_differential_phase
+  #     - echo_top_height
+  #     - max_z_height
+  #     - vil
+  #     - subml_ref_max
+  #     - column_depth_fraction
+  #     - subml_rhohv
+  #     - subml_zdr
+  #     - subml_kdp
+  #     - subml_zdr_gradient
+  #     - lowest_gate_reflectivity
+  #     - beam_height
+  #     - vertical_reflectivity_gradient
+  #     - melting_layer_height
+  #     - rhohv_min
+  #     - bright_band_ref
+  #     - bright_band_drop
+  #     - maxz_meltlayer_offset
+  #     - bright_band_intensity
+  #   loss: asym_mae
+  #   under_weight: 1.5
+  #   log_target: false
+  #   width: extra_wide
+  #   use_feature_masks: true
+  #   use_dem: true
+
+  - name: asymmae_nolog_bluntfilter_nosampler_submlrepl_xwide_featmask_uw2_random
     model_type: unet
+    pickle: dataset/outputs/3d/radar_gauge_dataset_subml_random_9500.pkl
     filter_mode: blunt
-    features: dualpol+vertical
-    loss: weighted_mae
+    features:
+      - reflectivity
+      - echo_top_height
+      - max_z_height
+      - vil
+      - subml_ref_max
+      - column_depth_fraction
+      - subml_rhohv
+      - subml_zdr
+      - subml_kdp
+      - subml_zdr_gradient
+      # - lowest_gate_reflectivity
+      # - beam_height
+      - vertical_reflectivity_gradient
+      - melting_layer_height
+      - rhohv_min
+      - bright_band_ref
+      - bright_band_drop
+      - maxz_meltlayer_offset
+      - bright_band_intensity
+    loss: asym_mae
+    under_weight: 2
     log_target: false
     width: extra_wide
+    use_feature_masks: true
+    use_dem: true
+
+  - name: asymmae_nolog_bluntfilter_nosampler_submlrepl_xwide_featmask_uw2
+    model_type: unet
+    pickle: dataset/outputs/3d/radar_gauge_dataset_subml_9500.pkl
+    filter_mode: blunt
+    features:
+      - reflectivity
+      - echo_top_height
+      - max_z_height
+      - vil
+      - subml_ref_max
+      - column_depth_fraction
+      - subml_rhohv
+      - subml_zdr
+      - subml_kdp
+      - subml_zdr_gradient
+      # - lowest_gate_reflectivity
+      # - beam_height
+      - vertical_reflectivity_gradient
+      - melting_layer_height
+      - rhohv_min
+      - bright_band_ref
+      - bright_band_drop
+      - maxz_meltlayer_offset
+      - bright_band_intensity
+    loss: asym_mae
+    under_weight: 2
+    log_target: false
+    width: extra_wide
+    use_feature_masks: true
+    use_dem: true
+
+
+  # - name: asymmae_nolog_bluntfilter_nosampler_dpvertlowmeltbb_xwide_featmask_uw2_pruneneg
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features:
+  #     - reflectivity
+  #     - cross_correlation_ratio
+  #     - echo_top_height
+  #     - max_z_height
+  #     - vil
+  #     - low_level_ref
+  #     - low_level_zdr
+  #     - low_level_rhohv
+  #     - lowest_gate_reflectivity
+  #     - vertical_reflectivity_gradient
+  #     - melting_layer_height
+  #     - bright_band_ref
+  #     - bright_band_drop
+  #     - maxz_meltlayer_offset
+  #   loss: asym_mae
+  #   under_weight: 2
+  #   log_target: false
+  #   width: extra_wide
+  #   use_feature_masks: true
+  #   use_dem: true
+
+  # ----------------------------------------------------------------
+  # Deferred single-field removals (run only if pruneneg is ambiguous)
+  # ----------------------------------------------------------------
+
+  # - name: asymmae_nolog_bluntfilter_nosampler_dpvertlowmeltbb_xwide_featmask_uw2_nozdr
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [...]
+  #   loss: asym_mae
+  #   under_weight: 2
+  #   log_target: false
+  #   width: extra_wide
+  #   use_feature_masks: true
+  #   use_dem: true
+
+  # - name: asymmae_nolog_bluntfilter_nosampler_dpvertlowmeltbb_xwide_featmask_uw2_nodem
+  #   model_type: unet
+  #   filter_mode: blunt
+  #   features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+  #   loss: asym_mae
+  #   under_weight: 2
+  #   log_target: false
+  #   width: extra_wide
+  #   use_feature_masks: true
+  #   use_dem: false
+
+###### Try removing features (wide uw1.5 — already run June 6)
+
+#   - name: asymmae_nolog_bluntfilter_nosampler_dpvertlowbb_wide_featmask_uw15
+#     model_type: unet
+#     filter_mode: blunt
+#     features: [dualpol, vertical, lowlevel, brightband]
+#     loss: asym_mae
+#     under_weight: 1.5
+#     log_target: false
+#     width: wide
+#     use_feature_masks: true
+#     use_dem: true
+
+#   - name: asymmae_nolog_bluntfilter_nosampler_dpvertmeltbb_wide_featmask_uw15
+#     model_type: unet
+#     filter_mode: blunt
+#     features: [dualpol, vertical, meltinglayer, brightband]
+#     loss: asym_mae
+#     under_weight: 1.5
+#     log_target: false
+#     width: wide
+#     use_feature_masks: true
+#     use_dem: true
+
+#   - name: asymmae_nolog_bluntfilter_nosampler_dpvertlowmelt_wide_featmask_uw15
+#     model_type: unet
+#     filter_mode: blunt
+#     features: [dualpol, vertical, lowlevel, meltinglayer]
+#     loss: asym_mae
+#     under_weight: 1.5
+#     log_target: false
+#     width: wide
+#     use_feature_masks: true
+#     use_dem: true
+
+# ##### try radar filter
+
+#   - name: asymmae_log_radarfilter_nosampler_dpvertlowmeltbb_wide_featmask_uw15
+#     model_type: unet
+#     filter_mode: radar
+#     features: [dualpol, vertical, lowlevel, meltinglayer, brightband]
+#     loss: asym_mae
+#     under_weight: 1.5
+#     log_target: true
+#     width: wide
+#     use_feature_masks: true
+#     use_dem: true
+
 

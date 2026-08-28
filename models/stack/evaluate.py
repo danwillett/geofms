@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 
 from models.stack.model import PrecipitationStackModel
 from models.unet.dataset import RadarGaugeDataset, resolve_fields, compute_n_input_channels
-from models.stack.train import filter_bad_samples, filter_biased_extremes, filter_nan_radar, filter_suspect_station_days, filter_stations
+from models.stack.train import filter_bad_samples, filter_biased_extremes, filter_nan_radar, filter_suspect_station_days, filter_stations, filter_gauge_dumps
 
 DEFAULT_PICKLE   = 'dataset/outputs/radar_gauge_dataset_tr22_24_26_vl_23_25.pkl'
 DEFAULT_DEM      = 'dem/preserve_dem_10m_utm.tif'
@@ -55,7 +55,9 @@ def load_model(checkpoint_path, device):
     use_dem = cfg.get('use_dem', True)
     use_mask = cfg.get('use_mask', True)
     use_temporal_pos = cfg.get('use_temporal_pos', True)
-    in_channels = compute_n_input_channels(fields, use_mask, use_temporal_pos, use_dem)
+    use_feature_masks = cfg.get('use_feature_masks', False)
+    in_channels = compute_n_input_channels(fields, use_mask, use_temporal_pos, use_dem,
+                                           use_feature_masks)
 
     model = PrecipitationStackModel(
         in_channels=in_channels,
@@ -418,6 +420,7 @@ def evaluate(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, dem_pa
         use_mask=cfg.get('use_mask', True),
         use_temporal_pos=cfg.get('use_temporal_pos', True),
         log_target=cfg.get('log_target', True),
+        use_feature_masks=cfg.get('use_feature_masks', False),
     )
     val_ds = RadarGaugeDataset(pickle_path, split='val', augment=False, **ds_kwargs)
     val_ds.samples = filter_stations(val_ds.samples, exclude)
@@ -430,6 +433,7 @@ def evaluate(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, dem_pa
         val_ds.samples = filter_biased_extremes(val_ds.samples)
         val_ds.samples = filter_bad_samples(val_ds.samples)
     val_ds.samples = filter_suspect_station_days(val_ds.samples)
+    val_ds.samples = filter_gauge_dumps(val_ds.samples)
 
     val_loader = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=0, pin_memory=True)
 
@@ -472,6 +476,7 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
         use_mask=cfg.get('use_mask', True),
         use_temporal_pos=cfg.get('use_temporal_pos', True),
         log_target=cfg.get('log_target', True),
+        use_feature_masks=cfg.get('use_feature_masks', False),
     )
     test_ds.samples = filter_nan_radar(test_ds.samples)
     test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=0, pin_memory=True)

@@ -34,18 +34,41 @@ from tqdm import tqdm
 
 from weather.pull_weather import get_hourly_precipitation_by_station, get_offset_hourly_precipitation_by_station
 
-# ── Dual-pol fields — must match RadarDEMDataset.FIELDS exactly ──────────────
+# ── Radar fields — order MUST match radar/derive_features.OUTPUT_FIELDS and
+#    models/unet/dataset.PICKLE_FIELD_ORDER exactly ─────────────────────────────
 FIELDS = [
+    # legacy (dual-pol + vertical structure)
     'reflectivity',
-    'differential_reflectivity',
-    'cross_correlation_ratio',
-    'differential_phase',
-    'specific_differential_phase',
+    # 'differential_reflectivity',
+    # 'cross_correlation_ratio',
+    # 'differential_phase',
+    # 'specific_differential_phase',
     'echo_top_height',
     'max_z_height',
     'vil',
-    'low_level_ref',
+    # 'low_level_ref',
     'column_depth_fraction',
+    # new — low-level / warm-rain
+    # 'low_level_kdp',
+    # 'low_level_zdr',
+    # 'low_level_rhohv',
+    # 'lowest_gate_reflectivity',
+    # 'beam_height',
+    'vertical_reflectivity_gradient',
+    # new — melting layer / bright band
+    'melting_layer_height',
+    'rhohv_min',
+    # new — bright-band vertical structure
+    'bright_band_ref',
+    'bright_band_drop',
+    'maxz_meltlayer_offset',
+    'bright_band_intensity',
+    # sub-melting-layer liquid column (dynamic or warm-rain fallback)
+    'subml_rhohv',
+    'subml_zdr',
+    'subml_kdp',
+    'subml_ref_max',
+    'subml_zdr_gradient',
 ]
 
 # Station bias flags  (1 = over-estimator, -1 = under-estimator, 0 = unknown)
@@ -205,6 +228,7 @@ def create_training_samples(
     patch_size_m=4500,
     half_hour_offsets=False,
     include_test=False,
+    split_by=None,
 ):
     """
     Build aligned radar-gauge samples and save to a pickle file.
@@ -381,8 +405,28 @@ def create_training_samples(
             raise ValueError(f"No training samples for years {train_years}!")
         if not val_samples:
             raise ValueError(f"No validation samples for years {val_years}!")
+    elif split_by == 'day':
+        # Group by unique calendar day, then assign whole days to train or val.
+        # This prevents any same-day hours from appearing in both splits, which
+        # would let the model see partial observations of a storm during training
+        # and then be evaluated on the remaining hours of the same storm.
+        print("   Day-group random 80/20 split (no day's hours split across train/val)")
+        np.random.seed(42)
+        unique_days = sorted({s['hour_start'].date() for s in samples})
+        days_arr = np.array(unique_days)
+        perm = np.random.permutation(len(days_arr))
+        n_train_days = int(0.8 * len(days_arr))
+        train_day_set = set(days_arr[perm[:n_train_days]])
+        val_day_set   = set(days_arr[perm[n_train_days:]])
+        train_samples = [s for s in samples if s['hour_start'].date() in train_day_set]
+        val_samples   = [s for s in samples if s['hour_start'].date() in val_day_set]
+        print(f"   Train days: {len(train_day_set)}  |  Val days: {len(val_day_set)}")
+        if not train_samples:
+            raise ValueError("No training samples after day-group split!")
+        if not val_samples:
+            raise ValueError("No validation samples after day-group split!")
     else:
-        print("   Random 80/20 split")
+        print("   Random 80/20 split (sample-level — use --split-by day to avoid within-day leakage)")
         np.random.seed(42)
         idx = np.random.permutation(len(samples))
         split = int(0.8 * len(samples))
@@ -494,7 +538,7 @@ def create_training_samples(
             'end_date':        str(end_date),
             'day_filter_file': day_filter_file,
             'specific_days':   [str(d) for d in dates] if dates else None,
-            'split_type':      'temporal' if train_years else 'random',
+            'split_type':      'temporal' if train_years else ('day_group' if split_by == 'day' else 'random'),
             'train_years':     train_years or 'N/A',
             'val_years':       val_years   or 'N/A',
             'created':         datetime.now().isoformat(),
@@ -746,6 +790,12 @@ if __name__ == '__main__':
                         help='Add 30-min offset samples to training set (nearly doubles training data)')
     parser.add_argument('--include-test', action='store_true',
                         help='Also generate test samples from daily cumulative gauges')
+    parser.add_argument('--split-by', choices=['sample', 'day'], default='sample',
+                        help='How to split train/val when not using --train-years/--val-years. '
+                             '"sample" (default): shuffle individual station-hours. '
+                             '"day": shuffle whole calendar days so no day\'s hours are split '
+                             'across train and val (eliminates within-storm leakage).')
+
     parser.add_argument('--inspect', action='store_true',
                         help='Inspect an existing pickle instead of building one')
 
@@ -777,4 +827,5 @@ if __name__ == '__main__':
             patch_size_m     = args.patch_size,
             half_hour_offsets = args.half_hour_offsets,
             include_test     = args.include_test,
+            split_by         = args.split_by,
         )

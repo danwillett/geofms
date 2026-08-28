@@ -14,14 +14,14 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from pathlib import Path
-from terratorch.tasks import PixelwiseRegressionTask
 
+from models.gfm.model import UpscalingPrecipTask
 from models.gfm.dataset import RadarDEMDataModule, create_heavy_rain_sampler
 
 
 # ── DEFAULT CONFIG ──────────────────────────────────────────────────────────────
-DEFAULT_PICKLE   = "deep_learning/radar_gauge_dataset_9x9.pkl"
-DEFAULT_CKPT_DIR = "checkpoints/terramind_dualpol"
+DEFAULT_PICKLE   = "dataset/outputs/3d/radar_gauge_dataset_subml_daygroup_offsets_9500.pkl"
+DEFAULT_CKPT_DIR = "models/checkpoints/terramind_dualpol"
 DEFAULT_OUTPUT   = "evaluation_figures"
 # ───────────────────────────────────────────────────────────────────────────────
 
@@ -47,48 +47,74 @@ def load_model(checkpoint_path: str) -> tuple:
     """Load model from checkpoint and return (model, device)."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Loading model from: {checkpoint_path}")
-    model = PixelwiseRegressionTask.load_from_checkpoint(checkpoint_path)
+    model = UpscalingPrecipTask.load_from_checkpoint(checkpoint_path)
     model.eval()
     model.to(device)
     print("✓ Model loaded successfully!")
     return model, device
 
 
+def _center_predict(model, batch, device):
+    """Upscale a batch (GPU) and return (pred_center, target_center) raw arrays.
+
+    Mirrors UpscalingPrecipTask's step-time upscaling since we call model.model()
+    directly (bypassing the LightningModule step hooks).
+    """
+    batch_up  = UpscalingPrecipTask._upscale_batch(batch)
+    image_gpu = {k: v.to(device) for k, v in batch_up["image"].items()}
+    pred      = model.model(image_gpu).output
+    if pred.dim() == 4:           # (B, 1, H, W) -> (B, H, W)
+        pred = pred[:, 0]
+    out    = batch["mask"].shape[-1]
+    center = out // 2
+    pred_center   = pred[:, center, center].cpu().numpy()
+    target_center = batch["mask"][:, center, center].numpy()
+    return pred_center, target_center
+
+
+def estimate_jensen_correction(pred_log, target_log):
+    """Jensen bias term for log1p targets: c = Var(y_log - ŷ_log) / 2.
+
+    Applied at inference as expm1(ŷ_log + c) to approximate E[mm | X] when the
+    model predicts a point estimate in log1p space. Estimated once on validation.
+    """
+    pred_log = np.asarray(pred_log, dtype=np.float64)
+    target_log = np.asarray(target_log, dtype=np.float64)
+    residuals = target_log - pred_log
+    return 0.5 * float(np.var(residuals))
+
+
+def log1p_to_mm(pred_log, correction=0.0):
+    """Map log1p-space predictions to mm/hr with optional Jensen correction."""
+    return np.maximum(np.expm1(np.asarray(pred_log, dtype=np.float64) + correction), 0.0)
+
+
 def run_inference(model, datamodule, device) -> tuple:
     """
     Run inference over the validation set.
 
-    Returns:
-        preds_mm, targets_mm : np.ndarray
-            Predictions and targets converted from log space to real mm/hr.
+    Returns the RAW model-space predictions/targets (log1p space when the model
+    was trained with log_target). The caller handles the mm conversion and the
+    Jensen correction so the correction can be estimated once and reused for the
+    daily-test aggregation.
     """
-    all_preds_log   = []
-    all_targets_log = []
+    all_preds, all_targets = [], []
 
     datamodule.setup()
     print("Running inference on validation set...")
 
     with torch.no_grad():
         for batch in datamodule.val_dataloader():
-            image_gpu  = {k: v.to(device) for k, v in batch["image"].items()}
-            model_out  = model.model(image_gpu)
-            pred       = model_out.output                        # (B, 1, H, W)
-            pred_center   = pred[:, 2, 2].cpu().numpy()      # centre pixel
-            target_center = batch["mask"][:, 2, 2].numpy()
+            pred_center, target_center = _center_predict(model, batch, device)
+            all_preds.extend(pred_center.tolist())
+            all_targets.extend(target_center.tolist())
 
-            all_preds_log.extend(pred_center.tolist())
-            all_targets_log.extend(target_center.tolist())
+    preds   = np.array(all_preds)
+    targets = np.array(all_targets)
 
-    preds_log   = np.array(all_preds_log)
-    targets_log = np.array(all_targets_log)
-
-    # Remove ignore-index values
-    valid = targets_log > -9000
-    preds_mm   = np.expm1(preds_log[valid])
-    targets_mm = np.expm1(targets_log[valid])
-
+    valid = targets > -9000
     print(f"✓ Collected {valid.sum()} valid samples")
-    return preds_mm, targets_mm
+    return preds[valid], targets[valid]
 
 
 def compute_metrics(preds_mm: np.ndarray, targets_mm: np.ndarray) -> dict:
@@ -101,14 +127,23 @@ def compute_metrics(preds_mm: np.ndarray, targets_mm: np.ndarray) -> dict:
     return dict(r2=r2, mae=mae, rmse=rmse)
 
 
-def print_report(preds_mm, targets_mm, metrics):
+def print_report(preds_mm, targets_mm, metrics, metrics_jensen=None, jensen_c=None):
     """Print detailed evaluation report to stdout."""
     print(f"\n{'='*60}")
     print(f"📊 TERRAMIND MODEL EVALUATION")
     print(f"{'='*60}")
-    print(f"\n  R²:         {metrics['r2']:.3f}")
-    print(f"  MAE:        {metrics['mae']:.3f} mm/hr")
-    print(f"  RMSE:       {metrics['rmse']:.3f} mm/hr")
+    if metrics_jensen is not None:
+        print(f"\n  R² (mm, naive expm1):      {metrics['r2']:.3f}")
+        print(f"  R² (mm, Jensen-corrected): {metrics_jensen['r2']:.3f}")
+        print(f"  Jensen c (= σ²_ε/2):       {jensen_c:.6f}")
+        print(f"  MAE (naive):    {metrics['mae']:.3f} mm/hr")
+        print(f"  MAE (Jensen):   {metrics_jensen['mae']:.3f} mm/hr")
+        print(f"  RMSE (naive):   {metrics['rmse']:.3f} mm/hr")
+        print(f"  RMSE (Jensen):  {metrics_jensen['rmse']:.3f} mm/hr")
+    else:
+        print(f"\n  R²:         {metrics['r2']:.3f}")
+        print(f"  MAE:        {metrics['mae']:.3f} mm/hr")
+        print(f"  RMSE:       {metrics['rmse']:.3f} mm/hr")
     print(f"  Pred max:   {preds_mm.max():.2f} mm/hr")
     print(f"  # Pred >5mm: {int(np.sum(preds_mm > 5))}")
 
@@ -199,7 +234,44 @@ def plot_evaluation(preds_mm, targets_mm, metrics, output_dir: str):
     save_path = out / "terramind_evaluation.png"
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     print(f"✓ Saved evaluation plot to: {save_path}")
-    plt.show()
+    plt.close()
+
+
+def plot_jensen_comparison(targets, preds_naive, preds_jensen,
+                           metrics_naive, metrics_jensen, jensen_c,
+                           output_dir, filename, unit="mm/hr"):
+    """Side-by-side naive-expm1 vs Jensen-corrected scatter (log-space runs only).
+
+    The main evaluation figures always chart the naive predictions so that
+    log- and raw-space runs are directly comparable; this extra figure shows
+    what the Jensen correction does for a given log-space run.
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    max_val = max(float(targets.max()), float(preds_naive.max()), float(preds_jensen.max()))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True)
+
+    panels = [
+        (axes[0], preds_naive,  metrics_naive,  "Naive expm1"),
+        (axes[1], preds_jensen, metrics_jensen, f"Jensen-corrected (c={jensen_c:.4f})"),
+    ]
+    for ax, preds, m, label in panels:
+        ax.scatter(targets, preds, alpha=0.3, s=20, c="steelblue")
+        ax.plot([0, max_val], [0, max_val], "r--", lw=2, label="Perfect")
+        ax.set_xlabel(f"Actual ({unit})")
+        ax.set_ylabel(f"Predicted ({unit})")
+        ax.set_title(f"{label}\nR²={m['r2']:.3f}, MAE={m['mae']:.3f} {unit}")
+        ax.set_xlim(0, max_val * 1.05)
+        ax.set_ylim(0, max_val * 1.05)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    save_path = out / filename
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"✓ Saved Jensen comparison plot to: {save_path}")
 
 
 def evaluate(
@@ -207,29 +279,111 @@ def evaluate(
     checkpoint_dir:  str = DEFAULT_CKPT_DIR,
     pickle_path:     str = DEFAULT_PICKLE,
     output_dir:      str = DEFAULT_OUTPUT,
+    output_size:     int = 9,
+    log_target:      bool = True,
+    fields=None,
+    use_feature_masks: bool = True,
+    filter_mode:     str = 'blunt',
+    dem_norm:        str = 'minmax',
+    run_dir:         str = None,
 ):
     ckpt  = find_checkpoint(checkpoint_path, checkpoint_dir)
     model, device = load_model(ckpt)
 
+    # Prefer saving figures into the run directory (mirrors stack/unet).
+    fig_dir = run_dir if run_dir else output_dir
+
     datamodule = RadarDEMDataModule(
         pickle_path=pickle_path,
+        output_size=output_size,
+        fields=fields,
+        use_feature_masks=use_feature_masks,
+        log_target=log_target,
+        dem_norm=dem_norm,
         weight_sampler=create_heavy_rain_sampler,
         batch_size=32,
+        filter_mode=filter_mode,
     )
 
-    preds_mm, targets_mm = run_inference(model, datamodule, device)
-    metrics = compute_metrics(preds_mm, targets_mm)
-    print_report(preds_mm, targets_mm, metrics)
-    plot_evaluation(preds_mm, targets_mm, metrics, output_dir)
+    preds_raw, targets_raw = run_inference(model, datamodule, device)
+
+    # Convert to mm, estimating the Jensen retransformation correction on the
+    # validation residuals (log space) so it can be reused for the daily test.
+    if log_target:
+        jensen_c        = estimate_jensen_correction(preds_raw, targets_raw)
+        preds_mm        = log1p_to_mm(preds_raw, 0.0)
+        targets_mm      = np.expm1(targets_raw)
+        preds_mm_jensen = log1p_to_mm(preds_raw, jensen_c)
+        metrics         = compute_metrics(preds_mm, targets_mm)
+        metrics_jensen  = compute_metrics(preds_mm_jensen, targets_mm)
+    else:
+        jensen_c        = 0.0
+        preds_mm        = np.maximum(preds_raw, 0.0)
+        targets_mm      = targets_raw
+        metrics         = compute_metrics(preds_mm, targets_mm)
+        metrics_jensen  = None
+
+    print_report(preds_mm, targets_mm, metrics, metrics_jensen=metrics_jensen,
+                 jensen_c=jensen_c if log_target else None)
+    # Main chart always uses NAIVE (native) predictions so log- and raw-space
+    # runs are comparable across experiments.
+    plot_evaluation(preds_mm, targets_mm, metrics, fig_dir)
+    # Extra side-by-side naive vs Jensen chart for log-space runs only.
+    if log_target and metrics_jensen is not None:
+        plot_jensen_comparison(targets_mm, preds_mm, preds_mm_jensen,
+                               metrics, metrics_jensen, jensen_c,
+                               fig_dir, "terramind_jensen_comparison.png", unit="mm/hr")
 
     # Test evaluation (daily gauges)
-    evaluate_test(model, device, pickle_path, output_dir)
+    test_summary = evaluate_test(
+        model, device, pickle_path, fig_dir,
+        output_size=output_size, log_target=log_target,
+        fields=fields, use_feature_masks=use_feature_masks,
+        dem_norm=dem_norm, jensen_c=jensen_c)
 
-    return metrics
+    # ── Persist val + test metrics into the run's config.json so each run keeps
+    #    its own numbers (the sweep summary otherwise gets overwritten). ──
+    val_summary = {
+        'r2_naive':   float(metrics['r2']),
+        'mae_naive':  float(metrics['mae']),
+        'rmse_naive': float(metrics['rmse']),
+        'r2_jensen':  (float(metrics_jensen['r2']) if metrics_jensen else None),
+        'mae_jensen': (float(metrics_jensen['mae']) if metrics_jensen else None),
+        'jensen_c':   (float(jensen_c) if log_target else None),
+    }
+    final_dir = run_dir if run_dir else str(Path(ckpt).parent)
+    _persist_metrics(final_dir, val_summary, test_summary)
+
+    # Headline = naive metrics, so all runs (incl. raw-space) share one basis.
+    # Both naive and Jensen are still printed and charted above.
+    return metrics, test_summary, final_dir
 
 
-def evaluate_test(model, device, pickle_path, output_dir):
-    """Evaluate GFM model on daily cumulative gauge test set."""
+def _persist_metrics(run_dir, val_summary, test_summary):
+    """Append val/test metric summaries to the run's config.json if present."""
+    import json
+    cfg_path = Path(run_dir) / 'config.json'
+    if not cfg_path.exists():
+        return
+    try:
+        with open(cfg_path, 'r') as f:
+            cfg = json.load(f)
+        cfg['val_metrics']  = val_summary
+        cfg['test_metrics'] = test_summary
+        with open(cfg_path, 'w') as f:
+            json.dump(cfg, f, indent=2)
+        print(f"  ✓ Wrote val/test metrics into {cfg_path}")
+    except Exception as e:
+        print(f"  ⚠ Could not persist metrics to {cfg_path}: {e}")
+
+
+def evaluate_test(model, device, pickle_path, output_dir,
+                  output_size=9, log_target=True, fields=None, use_feature_masks=True,
+                  dem_norm='minmax', jensen_c=0.0):
+    """Evaluate GFM model on daily cumulative gauge test set.
+
+    Returns a summary dict of daily test metrics (naive + Jensen) or None.
+    """
     import pickle as pkl
     from torch.utils.data import DataLoader
 
@@ -239,35 +393,54 @@ def evaluate_test(model, device, pickle_path, output_dir):
     test_samples = dataset.get('test', [])
     if not test_samples:
         print("\n  No test samples in pickle — skipping daily gauge evaluation.")
-        return
+        return None
 
     print(f"\n{'='*60}")
     print("  TEST EVALUATION (daily cumulative gauges)")
     print(f"{'='*60}")
     print(f"  Hourly test samples: {len(test_samples)}")
 
-    from models.gfm.dataset import RadarDEMDataset, filter_bad_samples
+    from models.gfm.dataset import RadarDEMDataset, PICKLE_FIELD_ORDER
+    from models.unet.train import filter_bad_samples
+    meta         = dataset.get('metadata', {})
+    field_order  = list(meta.get('fields', PICKLE_FIELD_ORDER))
+    patch_size_m = meta.get('patch_size_m', 9500)
     test_samples = filter_bad_samples(test_samples)
 
-    test_ds = RadarDEMDataset(test_samples, dem_path='dem/preserve_dem_10m_utm.tif', patch_size_m=4620, augment=False)
+    test_ds = RadarDEMDataset(
+        test_samples,
+        field_order=field_order,
+        dem_path='dem/preserve_dem_10m_utm.tif',
+        patch_size_m=patch_size_m,
+        output_size=output_size,
+        augment=False,
+        use_feature_masks=use_feature_masks,
+        fields=fields,
+        log_target=log_target,
+        dem_norm=dem_norm,
+    )
     test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=0, pin_memory=True)
 
     hourly_preds = []
+    hourly_preds_jensen = []
     hourly_meta = []
     sample_idx = 0
 
     with torch.no_grad():
         for batch in test_loader:
-            image_gpu = {k: v.to(device) for k, v in batch["image"].items()}
-            model_out = model.model(image_gpu)
-            pred = model_out.output
-            pred_center = pred[:, 2, 2].cpu().numpy()
+            pred_center, _ = _center_predict(model, batch, device)
 
-            # Convert from log-space to mm
-            preds_mm_batch = np.expm1(pred_center)
+            # Convert from log-space to mm if trained in log space
+            if log_target:
+                preds_mm_batch = log1p_to_mm(pred_center, 0.0)
+                preds_mm_jensen_batch = log1p_to_mm(pred_center, jensen_c)
+            else:
+                preds_mm_batch = np.maximum(pred_center, 0.0)
+                preds_mm_jensen_batch = preds_mm_batch
 
             for i in range(preds_mm_batch.shape[0]):
-                hourly_preds.append(max(0.0, float(preds_mm_batch[i])))
+                hourly_preds.append(float(preds_mm_batch[i]))
+                hourly_preds_jensen.append(float(preds_mm_jensen_batch[i]))
                 sample = test_ds.samples[sample_idx]
                 hourly_meta.append({
                     'date': sample['date'],
@@ -279,40 +452,58 @@ def evaluate_test(model, device, pickle_path, output_dir):
 
     # Aggregate hourly predictions to daily totals
     from collections import defaultdict
-    daily_groups = defaultdict(lambda: {'pred_sum': 0.0, 'count': 0, 'actual': 0.0, 'station_name': ''})
+    daily_groups = defaultdict(lambda: {'pred_sum': 0.0, 'pred_jensen_sum': 0.0,
+                                         'count': 0, 'actual': 0.0, 'station_name': ''})
 
-    for pred, meta in zip(hourly_preds, hourly_meta):
+    for pred, pred_j, meta in zip(hourly_preds, hourly_preds_jensen, hourly_meta):
         key = (meta['date'], meta['station_id'])
         daily_groups[key]['pred_sum'] += pred
+        daily_groups[key]['pred_jensen_sum'] += pred_j
         daily_groups[key]['count'] += 1
         daily_groups[key]['actual'] = meta['daily_precip_mm']
         daily_groups[key]['station_name'] = meta['station_name']
 
     pred_daily = np.array([v['pred_sum'] for v in daily_groups.values()])
+    pred_daily_jensen = np.array([v['pred_jensen_sum'] for v in daily_groups.values()])
     actual_daily = np.array([v['actual'] for v in daily_groups.values()])
     hours_per_day = np.array([v['count'] for v in daily_groups.values()])
     station_names_daily = [v['station_name'] for v in daily_groups.values()]
 
     valid = hours_per_day >= 18
     pred_daily = pred_daily[valid]
+    pred_daily_jensen = pred_daily_jensen[valid]
     actual_daily = actual_daily[valid]
     station_names_daily = np.array(station_names_daily)[valid]
 
     if len(pred_daily) == 0:
         print("  No valid day-station groups with >=18 hours. Skipping.")
-        return
+        return None
 
     test_metrics = compute_metrics(pred_daily, actual_daily)
+    test_metrics_jensen = compute_metrics(pred_daily_jensen, actual_daily) if log_target else None
 
     print(f"\n  Day-station groups: {len(pred_daily)} (≥18 hrs coverage)")
-    print(f"  Avg hours/day:     {hours_per_day[valid].mean():.1f}")
-    print(f"\n  R²:         {test_metrics['r2']:.3f}")
-    print(f"  MAE:        {test_metrics['mae']:.3f} mm/day")
-    print(f"  RMSE:       {test_metrics['rmse']:.3f} mm/day")
+    print(f"  Avg hours/day:     {hours_per_day[valid].mean():.1f}  (max {hours_per_day[valid].max()})")
+    if test_metrics_jensen is not None:
+        print(f"\n  R² (mm/day, naive expm1):      {test_metrics['r2']:.3f}")
+        print(f"  R² (mm/day, Jensen-corrected): {test_metrics_jensen['r2']:.3f}")
+        print(f"  MAE (naive):   {test_metrics['mae']:.3f} mm/day")
+        print(f"  MAE (Jensen):  {test_metrics_jensen['mae']:.3f} mm/day")
+    else:
+        print(f"\n  R²:         {test_metrics['r2']:.3f}")
+        print(f"  MAE:        {test_metrics['mae']:.3f} mm/day")
+        print(f"  RMSE:       {test_metrics['rmse']:.3f} mm/day")
     print(f"  Pred range: {pred_daily.min():.2f} – {pred_daily.max():.2f} mm/day")
     print(f"  Actual range: {actual_daily.min():.2f} – {actual_daily.max():.2f} mm/day")
 
-    # Plot
+    # Extra side-by-side naive vs Jensen chart for log-space runs only.
+    if test_metrics_jensen is not None:
+        plot_jensen_comparison(actual_daily, pred_daily, pred_daily_jensen,
+                               test_metrics, test_metrics_jensen, jensen_c,
+                               output_dir, "test_daily_jensen_comparison.png",
+                               unit="mm/day")
+
+    # Main daily plot uses NAIVE predictions (consistent with validation chart).
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -356,7 +547,14 @@ def evaluate_test(model, device, pickle_path, output_dir):
     plt.close()
     print(f"  ✓ Saved test evaluation plot to: {save_path}")
 
-    return test_metrics
+    return {
+        'r2_naive':   float(test_metrics['r2']),
+        'mae_naive':  float(test_metrics['mae']),
+        'rmse_naive': float(test_metrics['rmse']),
+        'r2_jensen':  (float(test_metrics_jensen['r2']) if test_metrics_jensen else None),
+        'mae_jensen': (float(test_metrics_jensen['mae']) if test_metrics_jensen else None),
+        'n_groups':   int(len(pred_daily)),
+    }
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────────
@@ -366,6 +564,11 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint-dir", default=DEFAULT_CKPT_DIR, help="Directory to search for best checkpoint")
     parser.add_argument("--pickle",         default=DEFAULT_PICKLE,   help="Path to dataset pickle")
     parser.add_argument("--output-dir",     default=DEFAULT_OUTPUT,   help="Directory for saved figures")
+    parser.add_argument("--output-size",    type=int, default=9,      help="Radar crop size (must match training run)")
+    parser.add_argument("--no-log",         action="store_true",      help="Model was trained in raw mm-space")
+    parser.add_argument("--dem-norm",       default='minmax', choices=['minmax', 'terramind'],
+                        help="DEM normalization (must match the training run)")
+    parser.add_argument("--run-dir",        default=None,             help="Run directory to save figures into")
     args = parser.parse_args()
 
     evaluate(
@@ -373,4 +576,8 @@ if __name__ == "__main__":
         checkpoint_dir  = args.checkpoint_dir,
         pickle_path     = args.pickle,
         output_dir      = args.output_dir,
+        output_size     = args.output_size,
+        log_target      = not args.no_log,
+        dem_norm        = args.dem_norm,
+        run_dir         = args.run_dir,
     )

@@ -1,0 +1,83 @@
+# Experiment sweep for the from-scratch (untrained) multimodal GFM.
+#
+# Follow-up sweep: the prior 4-cell matrix (patch {1,2} x layout {single,grouped})
+# established that GROUPED + patch_size 2 is the best & most reproducible config
+# (lowest mean val loss, tightest seed spread). So we fix that as the base and
+# probe two regularization / generalization questions on it:
+#
+#   1. modality_drop_rate {0, 0.15, 0.30} — does randomly dropping modalities
+#      during training curb overfitting and improve the disjoint daily-test R²?
+#   2. use_dem {true, false} — how much skill is genuine radar vs. DEM-based
+#      terrain/location memorization? Dropping the DEM modality tests this.
+#
+# `seeds` (base-level) expands EVERY experiment into one run per seed, suffixed
+# _s<seed>, so we get a real spread (mean ± std) instead of a single fixed-seed
+# point. Stabilization is on by default now: precision auto-selects bf16-mixed
+# (fp32 dynamic range -> no fp16 overflow nans during warmup/dropout) and
+# gradient_clip_val=1.0. This fixes the nan crashes the dropout runs hit before.
+#
+# NOTE: 5 configs x 3 seeds = 15 runs, each ~2 h -> the full sweep is LONG (~25-30 h).
+#       Trim `seeds` (e.g. [42, 43]) or use --only <name>_s<seed> ... for subsets.
+#
+# Run:
+#   python -m models.gfm_untrained.run_experiments models/gfm_untrained/experiments.yaml --dry-run
+#   python -m models.gfm_untrained.run_experiments models/gfm_untrained/experiments.yaml
+#   python -m models.gfm_untrained.run_experiments models/gfm_untrained/experiments.yaml --only g_drop00_s42 g_drop00_s43 g_drop00_s44
+
+base:
+  pickle: dataset/outputs/3d/radar_gauge_dataset_subml_daygroup_offsets_9500.pkl
+  dem: dem/preserve_dem_10m_utm.tif
+  checkpoint_dir: models/checkpoints/gfm_untrained
+  output_dir: evaluation_figures/gfm_untrained
+
+  # data / target
+  output_size: 18          # native tile (clip of the 19x19 pickle)
+  log_target: true
+  use_feature_masks: true
+  filter_mode: blunt
+
+  # winning architecture: grouped DEM/RADAR/DUALPOL streams, patch_size 2
+  patch_size: 2
+  layout: grouped
+  dim: 128
+  depth: 4
+  heads: 4
+
+  # optimization
+  loss: huber
+  lr: 3.0e-4
+  weight_decay: 0.05
+  epochs: 150
+  warmup: 10
+  batch_size: 32
+  patience: 15
+
+  # stabilization (fixes fp16 nan crashes seen with modality dropout)
+  precision: auto          # auto -> bf16-mixed on capable GPUs
+  gradient_clip_val: 1.0
+
+  # seed spread: each config is run once per seed (name suffixed _s<seed>)
+  seeds: [42, 43, 44]
+
+  use_wandb: false
+  save_top_k: 3
+
+experiments:
+  # ── modality_drop_rate sweep (DEM kept) ───────────────────────────────────
+  - name: g_drop00            # baseline reference (matches prior p2_grouped)
+    mod_drop: 0.0
+
+  - name: g_drop15
+    mod_drop: 0.15
+
+  - name: g_drop30
+    mod_drop: 0.30
+
+  # ── DEM ablation ──────────────────────────────────────────────────────────
+  - name: g_nodem             # grouped {RADAR, DUALPOL}, no DEM
+    use_dem: false
+    mod_drop: 0.0
+
+  - name: g_nodem_drop15      # no DEM + light modality drop
+    use_dem: false
+    mod_drop: 0.15

@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 
 from models.unet.model import PrecipUNet, init_weights
 from models.unet.dataset import RadarGaugeDataset, resolve_fields, compute_n_input_channels
-from models.unet.train import filter_bad_samples, filter_biased_extremes, filter_nan_radar, filter_suspect_station_days, filter_stations, filter_radar_unsupported
+from models.unet.train import filter_bad_samples, filter_biased_extremes, filter_nan_radar, filter_suspect_station_days, filter_stations, filter_radar_unsupported, filter_gauge_dumps
 
 DEFAULT_PICKLE   = 'dataset/outputs/radar_gauge_dataset_with_offsets_9500.pkl'
 DEFAULT_DEM      = 'dem/preserve_dem_10m_utm.tif'
@@ -55,7 +55,9 @@ def load_model(checkpoint_path, device):
     use_dem = cfg.get('use_dem', True)
     use_mask = cfg.get('use_mask', True)
     use_temporal_pos = cfg.get('use_temporal_pos', True)
-    in_channels = compute_n_input_channels(fields, use_mask, use_temporal_pos, use_dem)
+    use_feature_masks = cfg.get('use_feature_masks', False)
+    in_channels = compute_n_input_channels(fields, use_mask, use_temporal_pos, use_dem,
+                                           use_feature_masks)
 
     model = PrecipUNet(
         in_channels=in_channels,
@@ -70,9 +72,28 @@ def load_model(checkpoint_path, device):
     return model, cfg
 
 
+def estimate_jensen_correction(pred_log, target_log):
+    """Jensen bias term for log1p targets: c = Var(y_log - ŷ_log) / 2.
+
+    Applied at inference as expm1(ŷ_log + c) to approximate E[mm | X] when the
+    model predicts a point estimate in log1p space. Estimated once on validation.
+    """
+    pred_log = np.asarray(pred_log, dtype=np.float64)
+    target_log = np.asarray(target_log, dtype=np.float64)
+    residuals = target_log - pred_log
+    return 0.5 * float(np.var(residuals))
+
+
+def log1p_to_mm(pred_log, correction=0.0):
+    """Map log1p-space predictions to mm/hr with optional Jensen correction."""
+    return np.expm1(np.asarray(pred_log, dtype=np.float64) + correction)
+
+
 def run_inference(model, val_loader, device, log_target=True):
     all_preds = []
     all_targets = []
+    all_preds_log = []
+    all_targets_log = []
     all_station_names = []
 
     print("Running inference on validation set...")
@@ -110,6 +131,8 @@ def run_inference(model, val_loader, device, log_target=True):
                     pred_at_gauge = pred_map[:, 2, 2]
 
             if log_target:
+                all_preds_log.extend(pred_at_gauge.numpy().tolist())
+                all_targets_log.extend(target.numpy().tolist())
                 pred_at_gauge = torch.expm1(pred_at_gauge)
                 target = torch.expm1(target)
 
@@ -125,8 +148,11 @@ def run_inference(model, val_loader, device, log_target=True):
     targets_mm = targets_mm[valid]
     station_names = np.array(all_station_names)[valid]
 
+    pred_log = np.array(all_preds_log)[valid] if log_target else None
+    target_log = np.array(all_targets_log)[valid] if log_target else None
+
     print(f"✓ Collected {valid.sum()} valid samples")
-    return preds_mm, targets_mm, station_names
+    return preds_mm, targets_mm, station_names, pred_log, target_log
 
 
 def compute_metrics(preds_mm, targets_mm):
@@ -138,11 +164,16 @@ def compute_metrics(preds_mm, targets_mm):
     return dict(r2=r2, mae=mae, rmse=rmse)
 
 
-def print_report(preds_mm, targets_mm, metrics):
+def print_report(preds_mm, targets_mm, metrics, metrics_jensen=None, jensen_c=None):
     print(f"\n{'='*60}")
     print("  STACK CNN MODEL EVALUATION")
     print(f"{'='*60}")
-    print(f"\n  R²:         {metrics['r2']:.3f}")
+    if metrics_jensen is not None:
+        print(f"\n  R² (mm, naive expm1):     {metrics['r2']:.3f}")
+        print(f"  R² (mm, Jensen-corrected): {metrics_jensen['r2']:.3f}")
+        print(f"  Jensen c (= σ²_ε/2):       {jensen_c:.6f}")
+    else:
+        print(f"\n  R²:         {metrics['r2']:.3f}")
     print(f"  MAE:        {metrics['mae']:.3f} mm/hr")
     print(f"  RMSE:       {metrics['rmse']:.3f} mm/hr")
     print(f"  Pred max:   {preds_mm.max():.2f} mm/hr")
@@ -160,7 +191,7 @@ def print_report(preds_mm, targets_mm, metrics):
         print(f"    Pred >5mm: {int(np.sum(preds_mm[heavy] > 5))} / {heavy.sum()}")
 
 
-def write_eval_results(run_dir, preds_mm, targets_mm, metrics):
+def write_eval_results(run_dir, preds_mm, targets_mm, metrics, metrics_jensen=None, jensen_c=None):
     """Write evaluation results to results.txt in the run directory."""
     if not run_dir:
         return
@@ -173,7 +204,12 @@ def write_eval_results(run_dir, preds_mm, targets_mm, metrics):
     lines.append("  EVALUATION RESULTS")
     lines.append("=" * 60)
     lines.append("")
-    lines.append(f"  R²:            {metrics['r2']:.4f}")
+    if metrics_jensen is not None:
+        lines.append(f"  R² (mm, naive expm1):      {metrics['r2']:.4f}")
+        lines.append(f"  R² (mm, Jensen-corrected): {metrics_jensen['r2']:.4f}")
+        lines.append(f"  Jensen c (= σ²_ε/2):       {jensen_c:.6f}")
+    else:
+        lines.append(f"  R²:            {metrics['r2']:.4f}")
     lines.append(f"  MAE:           {metrics['mae']:.3f} mm/hr")
     lines.append(f"  RMSE:          {metrics['rmse']:.3f} mm/hr")
     lines.append(f"  Pred max:      {preds_mm.max():.2f} mm/hr")
@@ -193,7 +229,7 @@ def write_eval_results(run_dir, preds_mm, targets_mm, metrics):
         lines.append(f"    Pred >5mm: {int(np.sum(preds_mm[heavy] > 5))} / {int(heavy.sum())}")
         lines.append("")
 
-    with open(results_path, 'w') as f:
+    with open(results_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines) + '\n')
 
     print(f"  ✓ Saved evaluation results to: {results_path}")
@@ -415,6 +451,7 @@ def evaluate(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, dem_pa
         use_mask=cfg.get('use_mask', True),
         use_temporal_pos=cfg.get('use_temporal_pos', True),
         log_target=cfg.get('log_target', True),
+        use_feature_masks=cfg.get('use_feature_masks', False),
     )
     val_ds = RadarGaugeDataset(pickle_path, split='val', augment=False, **ds_kwargs)
     val_ds.samples = filter_stations(val_ds.samples, exclude)
@@ -426,25 +463,38 @@ def evaluate(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, dem_pa
         val_ds.samples = filter_biased_extremes(val_ds.samples)
         val_ds.samples = filter_bad_samples(val_ds.samples)
     val_ds.samples = filter_suspect_station_days(val_ds.samples)
+    val_ds.samples = filter_gauge_dumps(val_ds.samples)
 
     val_loader = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=0, pin_memory=True)
 
-    preds_mm, targets_mm, station_names = run_inference(
-        model, val_loader, device, log_target=cfg.get('log_target', True)
+    log_target = cfg.get('log_target', True)
+    preds_mm, targets_mm, station_names, pred_log, target_log = run_inference(
+        model, val_loader, device, log_target=log_target
     )
     metrics = compute_metrics(preds_mm, targets_mm)
-    print_report(preds_mm, targets_mm, metrics)
+
+    metrics_jensen = None
+    jensen_c = None
+    if log_target and pred_log is not None:
+        jensen_c = estimate_jensen_correction(pred_log, target_log)
+        preds_jensen = log1p_to_mm(pred_log, jensen_c)
+        metrics_jensen = compute_metrics(preds_jensen, targets_mm)
+
+    print_report(preds_mm, targets_mm, metrics, metrics_jensen=metrics_jensen, jensen_c=jensen_c)
     plot_evaluation(preds_mm, targets_mm, metrics, output_dir, run_dir=run_dir)
     plot_station_bias(preds_mm, targets_mm, station_names, output_dir, run_dir=run_dir)
-    write_eval_results(run_dir, preds_mm, targets_mm, metrics)
+    write_eval_results(run_dir, preds_mm, targets_mm, metrics,
+                       metrics_jensen=metrics_jensen, jensen_c=jensen_c)
 
     # Test evaluation (daily gauges)
-    evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir)
+    evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir,
+                  jensen_c=jensen_c if log_target else 0.0)
 
     return metrics, run_dir
 
 
-def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir=None):
+def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir=None,
+                  jensen_c=0.0):
     """Evaluate model on daily cumulative gauge test set."""
     import pickle as pkl
 
@@ -455,6 +505,8 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
     if not test_samples:
         print("\n  No test samples in pickle — skipping daily gauge evaluation.")
         return
+
+    log_target = cfg.get('log_target', True)
 
     print(f"\n{'='*60}")
     print("  TEST EVALUATION (daily cumulative gauges)")
@@ -467,13 +519,15 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
         use_dem=cfg.get('use_dem', True),
         use_mask=cfg.get('use_mask', True),
         use_temporal_pos=cfg.get('use_temporal_pos', True),
-        log_target=cfg.get('log_target', True),
+        log_target=log_target,
+        use_feature_masks=cfg.get('use_feature_masks', False),
     )
     test_ds.samples = filter_nan_radar(test_ds.samples)
     test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=0, pin_memory=True)
 
-    # Run hourly inference
+    # Run hourly inference (keep log-space preds when applicable for Jensen correction)
     hourly_preds = []
+    hourly_preds_jensen = []
     hourly_meta = []
     sample_idx = 0
 
@@ -503,10 +557,15 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
                     pred_at_gauge = pred_map[:, 2, 2]
 
             for i in range(pred_at_gauge.shape[0]):
-                pred_val = pred_at_gauge[i].item()
-                if cfg.get('log_target', True):
-                    pred_val = np.expm1(pred_val)
-                hourly_preds.append(max(0.0, pred_val))
+                pred_log = pred_at_gauge[i].item()
+                if log_target:
+                    pred_val = max(0.0, float(np.expm1(pred_log)))
+                    pred_jensen = max(0.0, float(np.expm1(pred_log + jensen_c)))
+                else:
+                    pred_val = max(0.0, pred_log)
+                    pred_jensen = pred_val
+                hourly_preds.append(pred_val)
+                hourly_preds_jensen.append(pred_jensen)
                 sample = test_ds.samples[sample_idx]
                 hourly_meta.append({
                     'date': sample['date'],
@@ -518,16 +577,20 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
 
     # Aggregate hourly predictions to daily totals
     from collections import defaultdict
-    daily_groups = defaultdict(lambda: {'pred_sum': 0.0, 'count': 0, 'actual': 0.0, 'station_name': ''})
+    daily_groups = defaultdict(lambda: {
+        'pred_sum': 0.0, 'pred_jensen_sum': 0.0, 'count': 0, 'actual': 0.0, 'station_name': ''
+    })
 
-    for pred, meta in zip(hourly_preds, hourly_meta):
+    for pred, pred_j, meta in zip(hourly_preds, hourly_preds_jensen, hourly_meta):
         key = (meta['date'], meta['station_id'])
         daily_groups[key]['pred_sum'] += pred
+        daily_groups[key]['pred_jensen_sum'] += pred_j
         daily_groups[key]['count'] += 1
         daily_groups[key]['actual'] = meta['daily_precip_mm']
         daily_groups[key]['station_name'] = meta['station_name']
 
     pred_daily = np.array([v['pred_sum'] for v in daily_groups.values()])
+    pred_daily_jensen = np.array([v['pred_jensen_sum'] for v in daily_groups.values()])
     actual_daily = np.array([v['actual'] for v in daily_groups.values()])
     hours_per_day = np.array([v['count'] for v in daily_groups.values()])
     station_names_daily = [v['station_name'] for v in daily_groups.values()]
@@ -535,6 +598,7 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
     # Only keep days with sufficient coverage (>=18 hours)
     valid = hours_per_day >= 18
     pred_daily = pred_daily[valid]
+    pred_daily_jensen = pred_daily_jensen[valid]
     actual_daily = actual_daily[valid]
     station_names_daily = np.array(station_names_daily)[valid]
 
@@ -544,10 +608,17 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
 
     # Metrics
     test_metrics = compute_metrics(pred_daily, actual_daily)
+    test_metrics_jensen = None
+    if log_target:
+        test_metrics_jensen = compute_metrics(pred_daily_jensen, actual_daily)
 
     print(f"\n  Day-station groups: {len(pred_daily)} (≥18 hrs coverage)")
     print(f"  Avg hours/day:     {hours_per_day[valid].mean():.1f}")
-    print(f"\n  R²:         {test_metrics['r2']:.3f}")
+    if test_metrics_jensen is not None:
+        print(f"\n  R² (mm, naive expm1):      {test_metrics['r2']:.3f}")
+        print(f"  R² (mm, Jensen-corrected): {test_metrics_jensen['r2']:.3f}")
+    else:
+        print(f"\n  R²:         {test_metrics['r2']:.3f}")
     print(f"  MAE:        {test_metrics['mae']:.3f} mm/day")
     print(f"  RMSE:       {test_metrics['rmse']:.3f} mm/day")
     print(f"  Pred range: {pred_daily.min():.2f} – {pred_daily.max():.2f} mm/day")
@@ -562,14 +633,22 @@ def evaluate_test(model, cfg, pickle_path, dem_path, device, output_dir, run_dir
             "=" * 60,
             "",
             f"  Day-station groups: {len(pred_daily)}",
-            f"  R²:          {test_metrics['r2']:.4f}",
+        ]
+        if test_metrics_jensen is not None:
+            lines.extend([
+                f"  R² (mm, naive expm1):      {test_metrics['r2']:.4f}",
+                f"  R² (mm, Jensen-corrected): {test_metrics_jensen['r2']:.4f}",
+            ])
+        else:
+            lines.append(f"  R²:          {test_metrics['r2']:.4f}")
+        lines.extend([
             f"  MAE:         {test_metrics['mae']:.3f} mm/day",
             f"  RMSE:        {test_metrics['rmse']:.3f} mm/day",
             f"  Pred range:  {pred_daily.min():.2f} – {pred_daily.max():.2f} mm/day",
             f"  Actual range: {actual_daily.min():.2f} – {actual_daily.max():.2f} mm/day",
             "",
-        ]
-        with open(results_path, 'w') as f:
+        ])
+        with open(results_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines) + '\n')
         print(f"  ✓ Saved test results to: {results_path}")
 

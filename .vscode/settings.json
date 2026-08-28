@@ -1,0 +1,34 @@
+{
+  // ── Python language server (Pylance) — biggest memory consumer ──────────────
+  // Only diagnose open files and skip whole-workspace indexing/analysis of the
+  // large data + checkpoint trees.
+  "python.analysis.diagnosticMode": "openFilesOnly",
+  "python.analysis.indexing": false,
+  "python.analysis.exclude": [
+    "**/models/checkpoints/**",
+    "**/dataset/outputs/**",
+    "**/data/**",
+    "**/wandb/**",
+    "**/dem/**"
+  ],
+
+  // ── File watcher — stop watching large binary trees (.ckpt/.pkl/.png/.tif) ──
+  "files.watcherExclude": {
+    "**/models/checkpoints/**": true,
+    "**/dataset/outputs/**": true,
+    "**/wandb/**": true,
+    "**/data/**": true,
+    "**/dem/**": true
+  },
+
+  // ── Search index — keep heavy artifact dirs out of search ───────────────────
+  "search.exclude": {
+    "**/models/checkpoints/**": true,
+    "**/dataset/outputs/**": true,
+    "**/wandb/**": true,
+    "**/data/**": true
+  },
+
+  // ── Terminal scrollback — training runs emit huge progress-bar output ───────
+  "terminal.integrated.scrollback": 2000
+}

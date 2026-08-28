@@ -120,6 +120,7 @@ def run_wind_correlation(run_dir, pred_threshold=8.0, actual_threshold=5.0):
         use_dem=cfg.get('use_dem', True),
         use_mask=cfg.get('use_mask', True),
         use_temporal_pos=cfg.get('use_temporal_pos', True),
+        use_feature_masks=cfg.get('use_feature_masks', False),
         log_target=log_target,
     )
 

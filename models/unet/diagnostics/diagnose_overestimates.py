@@ -6,7 +6,7 @@ Investigates whether these are model errors, gauge malfunctions, or
 legitimate radar signals that didn't reach the gauge.
 
 Run from project root:
-    python -m models.unet.diagnose_overestimates --run-dir models/checkpoints/unet_dualpol/<run_name>
+    python -m models.unet.diagnostics.diagnose_overestimates --run-dir models/checkpoints/unet_dualpol/<run_name>
 """
 
 import argparse
@@ -36,8 +36,13 @@ def extract_radar_features(sample, fields):
 
     features = {}
 
+    # Legacy fields + new bright-band discriminators (rhohv_min, melting layer,
+    # low-level RhoHV/ZDR) that the model now receives as inputs.
     for field_name in ['reflectivity', 'echo_top_height', 'max_z_height',
-                       'vil', 'low_level_ref', 'column_depth_fraction']:
+                       'vil', 'low_level_ref', 'column_depth_fraction',
+                       'rhohv_min', 'melting_layer_height',
+                       'low_level_rhohv', 'low_level_zdr',
+                       'vertical_reflectivity_gradient']:
         if field_name in PICKLE_FIELD_ORDER:
             idx = PICKLE_FIELD_ORDER.index(field_name)
             if idx < radar_patch.shape[1]:
@@ -73,6 +78,7 @@ def run_diagnostic(run_dir, pred_threshold=8.0, actual_threshold=5.0):
         use_dem=cfg.get('use_dem', True),
         use_mask=cfg.get('use_mask', True),
         use_temporal_pos=cfg.get('use_temporal_pos', True),
+        use_feature_masks=cfg.get('use_feature_masks', False),
         log_target=log_target,
     )
 
@@ -204,7 +210,11 @@ def run_diagnostic(run_dir, pred_threshold=8.0, actual_threshold=5.0):
     feature_keys = ['reflectivity_center_max', 'reflectivity_patch_max',
                     'echo_top_height_center_max', 'vil_center_max',
                     'max_z_height_center_max', 'low_level_ref_center_max',
-                    'column_depth_fraction_center_mean']
+                    'column_depth_fraction_center_mean',
+                    # new — direct bright-band discriminators (model inputs)
+                    'rhohv_min_center_mean', 'melting_layer_height_center_mean',
+                    'low_level_rhohv_center_mean', 'low_level_zdr_center_mean',
+                    'vertical_reflectivity_gradient_center_mean']
 
     over_medians = {}
     correct_medians = {}

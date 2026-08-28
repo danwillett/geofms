@@ -1,0 +1,15 @@
+# Exclude large data + artifact trees from Cursor's codebase indexing.
+# (Indexing only — these paths are still available as AI context if referenced.)
+models/checkpoints/
+dataset/outputs/
+data/
+wandb/
+dem/
+
+# Large binary / data file types
+*.ckpt
+*.pkl
+*.zarr
+*.tif
+*.npz
+*.npy

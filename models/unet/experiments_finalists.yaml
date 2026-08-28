@@ -1,0 +1,87 @@
+# Finalist replicates: 3 configs × 3 seeds (0,1,2) on the random-split pickle.
+# Goal: (1) measure seed noise (spread across seeds within a config),
+#       (2) compare the top daily-test performers under controlled seeds.
+#
+# Configs (everything else held fixed: asym_mae uw2, no sampler, feat masks, blunt):
+#   normal_raw   — width_normal (64),  raw mm-space     (best daily-test so far)
+#   xwide_raw    — width_extra_wide,   raw mm-space     (tests width effect)
+#   normal_log   — width_normal (64),  log-space+Jensen (calibrated route at best width)
+#
+# Run (no ablation, faster):
+#   python -m models.run_experiments models/unet/experiments_finalists.yaml --skip-ablation
+
+base:
+  model_type: unet
+  pickle: dataset/outputs/3d/radar_gauge_dataset_subml_daygroup_offsets_9500.pkl
+  dem: dem/preserve_dem_10m_utm.tif
+  patience: 15
+  epochs: 100
+  batch_size: 32
+  lr: 5.0e-5
+  filter_mode: blunt
+  use_dem: true
+  use_feature_masks: true
+  loss: asym_mae
+  under_weight: 2.0
+  no_sampler: true
+  features:
+    - reflectivity
+    - echo_top_height
+    - max_z_height
+    - vil
+    - column_depth_fraction
+    - vertical_reflectivity_gradient
+    - melting_layer_height
+    - rhohv_min
+    - bright_band_ref
+    - bright_band_drop
+    - maxz_meltlayer_offset
+    - bright_band_intensity
+    - subml_rhohv
+    - subml_zdr
+    - subml_kdp
+    - subml_ref_max
+    - subml_zdr_gradient
+
+experiments:
+  # ── normal width, raw mm-space ──────────────────────────────
+  - name: normal_raw_s0
+    width: normal
+    log_target: false
+    seed: 0
+  - name: normal_raw_s1
+    width: normal
+    log_target: false
+    seed: 1
+  - name: normal_raw_s2
+    width: normal
+    log_target: false
+    seed: 2
+
+  # ── extra_wide, raw mm-space (width effect) ─────────────────
+  - name: xwide_raw_s0
+    width: extra_wide
+    log_target: false
+    seed: 0
+  - name: xwide_raw_s1
+    width: extra_wide
+    log_target: false
+    seed: 1
+  - name: xwide_raw_s2
+    width: extra_wide
+    log_target: false
+    seed: 2
+
+  # ── normal width, log-space (+ Jensen at eval) ──────────────
+  - name: normal_log_s0
+    width: normal
+    log_target: true
+    seed: 0
+  - name: normal_log_s1
+    width: normal
+    log_target: true
+    seed: 1
+  - name: normal_log_s2
+    width: normal
+    log_target: true
+    seed: 2

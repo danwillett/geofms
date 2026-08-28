@@ -14,7 +14,7 @@ The goal is to decide which NEW radar-structure metrics are worth
 deriving from the 3D volume before regenerating the zarr.
 
 Run from project root:
-    python -m models.unet.diagnose_underestimates --run-dir models/checkpoints/unet_dualpol/<run_name>
+    python -m models.unet.diagnostics.diagnose_underestimates --run-dir models/checkpoints/unet_dualpol/<run_name>
 """
 
 import argparse
@@ -30,68 +30,8 @@ from models.unet.dataset import (
     RadarGaugeDataset, resolve_fields, compute_n_input_channels,
     PICKLE_FIELD_ORDER, FIELD_NORMS
 )
-from models.unet.train import (
-    filter_nan_radar, filter_biased_extremes, filter_bad_samples,
-    filter_suspect_station_days, filter_radar_unsupported
-)
-from models.unet.diagnose_overpredict_weather import query_hourly_avg
-
-
-# Fields we extract at the gauge pixel. Dual-pol fields are included because
-# they are the key discriminators for the warm-rain underestimation mechanism.
-SCALAR_MAX_FIELDS = [
-    'reflectivity', 'echo_top_height', 'max_z_height', 'vil',
-    'low_level_ref', 'column_depth_fraction',
-]
-MEAN_FIELDS = [
-    'differential_reflectivity', 'cross_correlation_ratio',
-    'specific_differential_phase',
-]
-
-
-def _valid_center(radar_patch, field_name):
-    """Return the valid (non-sentinel, non-NaN) center-pixel time series."""
-    if field_name not in PICKLE_FIELD_ORDER:
-        return np.array([])
-    idx = PICKLE_FIELD_ORDER.index(field_name)
-    if idx >= radar_patch.shape[1]:
-        return np.array([])
-    cy, cx = radar_patch.shape[2] // 2, radar_patch.shape[3] // 2
-    vals = radar_patch[:, idx, cy, cx]
-    vals = vals[(vals != -9999.0) & ~np.isnan(vals)]
-    return vals
-
-
-def extract_radar_features(sample, fields):
-    """Extract raw radar features at the center pixel for a sample."""
-    radar_patch = sample['radar_patch']  # (12, N_fields, H, W)
-    features = {}
-
-    for field_name in SCALAR_MAX_FIELDS:
-        valid = _valid_center(radar_patch, field_name)
-        features[f'{field_name}_center_max'] = np.nanmax(valid) if len(valid) else np.nan
-        features[f'{field_name}_center_mean'] = np.nanmean(valid) if len(valid) else np.nan
-        # patch max (over all pixels and scans)
-        if field_name in PICKLE_FIELD_ORDER:
-            idx = PICKLE_FIELD_ORDER.index(field_name)
-            if idx < radar_patch.shape[1]:
-                patch_vals = radar_patch[:, idx, :, :]
-                patch_vals = patch_vals[(patch_vals != -9999.0) & ~np.isnan(patch_vals)]
-                features[f'{field_name}_patch_max'] = (
-                    np.nanmax(patch_vals) if len(patch_vals) else np.nan)
-
-    for field_name in MEAN_FIELDS:
-        valid = _valid_center(radar_patch, field_name)
-        features[f'{field_name}_center_mean'] = np.nanmean(valid) if len(valid) else np.nan
-
-    # Derived: low-level enhancement (orographic / seeder-feeder proxy).
-    # low_level_ref (0-2km mean) minus the column-max reflectivity. A value
-    # near 0 (or positive) means the wettest layer is near the surface.
-    ll = features.get('low_level_ref_center_max', np.nan)
-    refl = features.get('reflectivity_center_max', np.nan)
-    features['lowlevel_minus_colmax'] = (ll - refl) if not (np.isnan(ll) or np.isnan(refl)) else np.nan
-
-    return features
+from models.unet.diagnostics.common import _valid_center, extract_radar_features
+from models.unet.diagnostics.diagnose_overpredict_weather import query_hourly_avg
 
 
 def run_diagnostic(run_dir, actual_threshold=5.0, ratio=0.75):
@@ -112,6 +52,7 @@ def run_diagnostic(run_dir, actual_threshold=5.0, ratio=0.75):
         use_dem=cfg.get('use_dem', True),
         use_mask=cfg.get('use_mask', True),
         use_temporal_pos=cfg.get('use_temporal_pos', True),
+        use_feature_masks=cfg.get('use_feature_masks', False),
         log_target=log_target,
     )
 
@@ -256,6 +197,15 @@ def run_diagnostic(run_dir, actual_threshold=5.0, ratio=0.75):
         'differential_reflectivity_center_mean',
         'cross_correlation_ratio_center_mean',
         'specific_differential_phase_center_mean',
+        # new — low-level / warm-rain discriminators (now model inputs)
+        'lowest_gate_reflectivity_center_max',
+        'beam_height_center_max',
+        'vertical_reflectivity_gradient_center_max',
+        'melting_layer_height_center_max',
+        'low_level_zdr_center_mean',
+        'low_level_rhohv_center_mean',
+        'low_level_kdp_center_mean',
+        'rhohv_min_center_mean',
     ]
     for key in feature_keys:
         u_vals = [f[key] for f in under_features if not np.isnan(f.get(key, np.nan))]

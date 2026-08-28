@@ -22,6 +22,23 @@ from tqdm import tqdm
 from models.unet.model import PrecipUNet, init_weights
 from models.unet.dataset import RadarGaugeDataset, resolve_fields, compute_n_input_channels
 
+
+def set_seed(seed):
+    """Seed Python, NumPy, and torch RNGs for reproducible runs.
+
+    Covers weight init, dropout, DataLoader shuffling, and the WeightedRandomSampler
+    (all draw from the global torch generator when no explicit generator is passed),
+    so two runs with the same seed and config are reproducible. Note: full bitwise
+    determinism on GPU would also require cudnn deterministic mode; this seeds the
+    dominant sources of run-to-run variance, which is what matters for replicates.
+    """
+    import random as _random
+    _random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 # ── DEFAULT CONFIG ────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = {
     'pickle_path':    'dataset/outputs/radar_gauge_dataset_with_offsets_9500.pkl',
@@ -35,6 +52,7 @@ DEFAULT_CONFIG = {
     'base_filters':   64,
     'add_bias':       False,
     'loss_type':      'mae',
+    'under_weight':   2.0,
     'max_precip':     100.0,
 }
 
@@ -44,12 +62,17 @@ DEFAULT_CONFIG = {
 class GaugePixelLoss(nn.Module):
     """Loss computed only at the gauge pixel location."""
 
-    def __init__(self, max_precip=100.0, loss_type='mae', huber_delta=2.0, log_target=False):
+    def __init__(self, max_precip=100.0, loss_type='mae', huber_delta=2.0, log_target=False,
+                 under_weight=2.0):
         super().__init__()
         self.max_precip = max_precip
         self.loss_type = loss_type
         self.huber_delta = huber_delta
         self.log_target = log_target
+        # Asymmetric losses: penalty multiplier applied when the model
+        # underpredicts (target > prediction). over-prediction keeps weight 1.0.
+        # under_weight=2.0 ≈ targeting the ~0.67 conditional quantile.
+        self.under_weight = under_weight
 
     def forward(self, pred_map, target, gauge_pixel):
         batch_size = pred_map.shape[0]
@@ -99,6 +122,25 @@ class GaugePixelLoss(nn.Module):
             else:
                 weights = 1.0 + (tgt_v / 5.0) ** 2
             return (weights * torch.abs(pred_v - tgt_v)).mean()
+        elif self.loss_type == 'asym_mae':
+            # Sign-based (quantile / "pinball") loss: penalize underprediction
+            # (tgt > pred) by under_weight, overprediction by 1.0. Shifts the
+            # model toward a higher conditional quantile without globally
+            # inflating predictions like a magnitude weight or heavy sampler.
+            err = tgt_v - pred_v
+            w = torch.where(err > 0,
+                            torch.as_tensor(self.under_weight, device=err.device, dtype=err.dtype),
+                            torch.as_tensor(1.0, device=err.device, dtype=err.dtype))
+            return (w * err.abs()).mean()
+        elif self.loss_type == 'asym_huber':
+            # Same asymmetric quantile target, but Huber base so a handful of
+            # extreme heavy-rain samples don't dominate / destabilize gradients.
+            err = tgt_v - pred_v
+            w = torch.where(err > 0,
+                            torch.as_tensor(self.under_weight, device=err.device, dtype=err.dtype),
+                            torch.as_tensor(1.0, device=err.device, dtype=err.dtype))
+            huber = F.smooth_l1_loss(pred_v, tgt_v, beta=self.huber_delta, reduction='none')
+            return (w * huber).mean()
         return torch.abs(pred_v - tgt_v).mean()
 
 
@@ -495,14 +537,17 @@ def save_config(run_dir, cfg, n_params, train_samples, val_samples, model):
     config_data = {
         'timestamp': datetime.now().isoformat(),
         'model_type': 'unet',
+        'seed': cfg.get('seed'),
         # Feature configuration
         'fields': fields,
         'use_dem': cfg.get('use_dem', True),
         'use_mask': cfg.get('use_mask', True),
         'use_temporal_pos': cfg.get('use_temporal_pos', True),
+        'use_feature_masks': cfg.get('use_feature_masks', False),
         'log_target': cfg.get('log_target', True),
         # Training params
         'loss_type': cfg.get('loss_type', 'mae'),
+        'under_weight': cfg.get('under_weight', 2.0),
         'lr': cfg.get('lr'),
         'weight_decay': cfg.get('weight_decay'),
         'batch_size': cfg.get('batch_size'),
@@ -522,7 +567,8 @@ def save_config(run_dir, cfg, n_params, train_samples, val_samples, model):
         'n_parameters': n_params,
         'n_input_channels': compute_n_input_channels(
             fields, cfg.get('use_mask', True),
-            cfg.get('use_temporal_pos', True), cfg.get('use_dem', True)
+            cfg.get('use_temporal_pos', True), cfg.get('use_dem', True),
+            cfg.get('use_feature_masks', False)
         ),
         'n_encoder_blocks': cfg.get('n_encoder_blocks', 3),
         'encoder_channels': encoder_channels,
@@ -541,6 +587,9 @@ def save_config(run_dir, cfg, n_params, train_samples, val_samples, model):
 
 def train(cfg: dict = None, run_name: str = None):
     cfg = cfg or dict(DEFAULT_CONFIG)
+    seed = cfg.get('seed')
+    if seed is not None:
+        set_seed(int(seed))
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     run_dir = create_run_dir(cfg['checkpoint_dir'], run_name)
@@ -550,6 +599,7 @@ def train(cfg: dict = None, run_name: str = None):
     print(f"  Device:  {device}")
     print(f"  Dataset: {cfg['pickle_path']}")
     print(f"  Epochs:  {cfg['max_epochs']}")
+    print(f"  Seed:    {seed if seed is not None else 'unseeded (random)'}")
     print(f"  Run dir: {run_dir}")
     print(f"{'='*60}\n")
 
@@ -561,6 +611,7 @@ def train(cfg: dict = None, run_name: str = None):
         use_mask=cfg.get('use_mask', True),
         use_temporal_pos=cfg.get('use_temporal_pos', True),
         log_target=cfg.get('log_target', True),
+        use_feature_masks=cfg.get('use_feature_masks', False),
     )
     train_ds = RadarGaugeDataset(cfg['pickle_path'], split='train', augment=True, aug_prob=0.5, **ds_kwargs)
     val_ds = RadarGaugeDataset(cfg['pickle_path'], split='val', augment=False, **ds_kwargs)
@@ -638,7 +689,8 @@ def train(cfg: dict = None, run_name: str = None):
     save_config(run_dir, cfg, n_params, len(train_ds.samples), len(val_ds.samples), model)
 
     criterion = GaugePixelLoss(max_precip=cfg['max_precip'], loss_type=cfg['loss_type'],
-                               log_target=cfg.get('log_target', True))
+                               log_target=cfg.get('log_target', True),
+                               under_weight=cfg.get('under_weight', 2.0))
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
@@ -712,7 +764,9 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=DEFAULT_CONFIG['batch_size'])
     parser.add_argument('--patience', type=int, default=DEFAULT_CONFIG['patience'])
     parser.add_argument('--base-filters', type=int, default=DEFAULT_CONFIG['base_filters'])
-    parser.add_argument('--loss', choices=['mae', 'mse', 'huber', 'weighted_mae', 'weighted_mae_sq'], default=DEFAULT_CONFIG['loss_type'])
+    parser.add_argument('--loss', choices=['mae', 'mse', 'huber', 'weighted_mae', 'weighted_mae_sq', 'asym_mae', 'asym_huber'], default=DEFAULT_CONFIG['loss_type'])
+    parser.add_argument('--under-weight', type=float, default=DEFAULT_CONFIG['under_weight'],
+                        help='Underprediction penalty for asym_mae/asym_huber (1.0=symmetric, >1 favors higher predictions)')
     parser.add_argument('--no-sampler', action='store_true', help='Disable weighted sampler (use uniform sampling)')
     parser.add_argument('--sampler-type', choices=['light', 'moderate', 'heavy'], default='moderate',
                         help='Sampler intensity preset (default: moderate)')
@@ -720,9 +774,11 @@ if __name__ == '__main__':
     parser.add_argument('--filter-mode', choices=['blunt', 'radar'], default='blunt',
                         help='Filter mode: blunt (station-based caps) or radar (physics-based)')
     parser.add_argument('--run-name', default=None, help='Short description suffix for the run folder')
+    parser.add_argument('--seed', type=int, default=None, help='Random seed for reproducible runs (default: unseeded)')
     args = parser.parse_args()
 
     cfg = dict(DEFAULT_CONFIG)
+    cfg['seed'] = args.seed
     cfg['pickle_path'] = args.pickle
     cfg['dem_path'] = args.dem
     cfg['checkpoint_dir'] = args.ckpt_dir
@@ -732,6 +788,7 @@ if __name__ == '__main__':
     cfg['patience'] = args.patience
     cfg['base_filters'] = args.base_filters
     cfg['loss_type'] = args.loss
+    cfg['under_weight'] = args.under_weight
     cfg['no_sampler'] = args.no_sampler
     cfg['sampler_type'] = args.sampler_type
     cfg['exclude_stations'] = args.exclude_stations

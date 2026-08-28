@@ -1,0 +1,22 @@
+# 3D Stack model experiments
+# Run with: python -m models.run_experiments models/stack_3d/experiments.yaml
+# Dry run:  python -m models.run_experiments models/stack_3d/experiments.yaml --dry-run
+
+base:
+  model_type: stack_3d
+  pickle: dataset/outputs/3d/radar_gauge_dataset_3d_4500.pkl
+  dem: dem/preserve_dem_10m_utm.tif
+  patience: 20
+  epochs: 100
+  batch_size: 8
+  lr: 5.0e-5
+  no_sampler: true
+  filter_mode: blunt
+  spatial_head: true
+  features: dualpol
+  loss: mae
+  log_target: true
+
+experiments:
+  - name: stack3d_mae_blunt_dualpol_4500
+    notes: MVP 3D stack — lazy zarr pickle, Conv3d spatial head

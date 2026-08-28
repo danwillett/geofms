@@ -1,0 +1,90 @@
+# Stack CNN finalist replicates — mirrors unet/experiments_finalists.yaml
+# Same 3 configs x 3 seeds on the daygroup+offsets pickle for a clean
+# architecture comparison against the U-Net under identical conditions.
+#
+# Configs:
+#   normal_raw   — default width, raw mm-space  (asym_mae uw2, no sampler)
+#   xwide_raw    — extra_wide,   raw mm-space    (tests width effect)
+#   normal_log   — default width, log-space+Jensen
+#
+# Run (skip ablation for speed):
+#   python -m models.run_experiments models/stack/experiments_finalists.yaml --skip-ablation
+
+base:
+  model_type: stack
+  pickle: dataset/outputs/3d/radar_gauge_dataset_subml_daygroup_offsets_9500.pkl
+  dem: dem/preserve_dem_10m_utm.tif
+  patience: 15
+  epochs: 100
+  batch_size: 32
+  lr: 5.0e-5
+  filter_mode: blunt
+  use_dem: true
+  use_feature_masks: true
+  loss: asym_mae
+  under_weight: 2.0
+  no_sampler: true
+  features:
+    - reflectivity
+    - echo_top_height
+    - max_z_height
+    - vil
+    - column_depth_fraction
+    - vertical_reflectivity_gradient
+    - melting_layer_height
+    - rhohv_min
+    - bright_band_ref
+    - bright_band_drop
+    - maxz_meltlayer_offset
+    - bright_band_intensity
+    - subml_rhohv
+    - subml_zdr
+    - subml_kdp
+    - subml_ref_max
+    - subml_zdr_gradient
+
+experiments:
+  # ── default width, raw mm-space ─────────────────────────────
+  - name: normal_raw_s0
+    model_type: stack
+    log_target: false
+    seed: 0
+  - name: normal_raw_s1
+    model_type: stack
+    log_target: false
+    seed: 1
+  - name: normal_raw_s2
+    model_type: stack
+    log_target: false
+    seed: 2
+
+  # ── extra_wide, raw mm-space ────────────────────────────────
+  - name: xwide_raw_s0
+    model_type: stack
+    width: extra_wide
+    log_target: false
+    seed: 0
+  - name: xwide_raw_s1
+    model_type: stack
+    width: extra_wide
+    log_target: false
+    seed: 1
+  - name: xwide_raw_s2
+    model_type: stack
+    width: extra_wide
+    log_target: false
+    seed: 2
+
+  # ── default width, log-space (+ Jensen at eval) ─────────────
+  - name: normal_log_s0
+    model_type: stack
+    log_target: true
+    seed: 0
+  - name: normal_log_s1
+    model_type: stack
+    log_target: true
+    seed: 1
+  - name: normal_log_s2
+    model_type: stack
+    log_target: true
+    seed: 2

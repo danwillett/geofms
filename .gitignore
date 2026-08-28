@@ -3,7 +3,11 @@
 .env
 
 data/
-checkpoints/
 
 wandb/
 __pycache__/
+radar/outputs/
+radar/logs/
+evaluation_figures/
+functions/
+checkpoints/

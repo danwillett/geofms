@@ -1,0 +1,82 @@
+# 2D U-Net sweep on the random-split pickle.
+# One axis varied per experiment from a fixed baseline
+# (extra_wide / asym_mae uw2 / no sampler / raw mm-space / feature masks).
+#
+# Run with:
+#   python -m models.run_experiments models/unet/experiments_random_sweep.yaml --skip-ablation
+# Preview:
+#   python -m models.run_experiments models/unet/experiments_random_sweep.yaml --dry-run
+
+base:
+  model_type: unet
+  pickle: dataset/outputs/3d/radar_gauge_dataset_subml_random_9500.pkl
+  dem: dem/preserve_dem_10m_utm.tif
+  patience: 15
+  epochs: 100
+  batch_size: 32
+  lr: 5.0e-5
+  filter_mode: blunt
+  use_dem: true
+  use_feature_masks: true
+  log_target: false
+  loss: asym_mae
+  under_weight: 2.0
+  no_sampler: true
+  width: extra_wide
+  features:            # exactly the 17 fields stored in this pickle
+    - reflectivity
+    - echo_top_height
+    - max_z_height
+    - vil
+    - column_depth_fraction
+    - vertical_reflectivity_gradient
+    - melting_layer_height
+    - rhohv_min
+    - bright_band_ref
+    - bright_band_drop
+    - maxz_meltlayer_offset
+    - bright_band_intensity
+    - subml_rhohv
+    - subml_zdr
+    - subml_kdp
+    - subml_ref_max
+    - subml_zdr_gradient
+
+experiments:
+  # ── baseline ────────────────────────────────────────────────
+  - name: base_xwide_asymmae_uw2_nosamp_raw
+
+  # ── WIDTH (hold loss/sampler/log fixed) ─────────────────────
+  - name: width_normal
+    width: normal
+  - name: width_wide
+    width: wide
+  - name: width_xxwide
+    width: extra_extra_wide
+
+  # ── SAMPLER (hold width=extra_wide) ─────────────────────────
+  - name: sampler_light
+    no_sampler: false
+    sampler_type: light
+  - name: sampler_moderate
+    no_sampler: false
+    sampler_type: moderate
+  - name: sampler_heavy
+    no_sampler: false
+    sampler_type: heavy
+
+  # ── LOSS TYPE (hold width=extra_wide, no sampler) ───────────
+  - name: loss_mae
+    loss: mae
+  - name: loss_weighted_mae
+    loss: weighted_mae
+  - name: loss_asym_huber_uw2
+    loss: asym_huber
+  - name: loss_asymmae_uw1p5
+    under_weight: 1.5
+  - name: loss_asymmae_uw2p5
+    under_weight: 2.5
+
+  # ── TARGET SPACE ────────────────────────────────────────────
+  - name: logspace_asymmae_uw2
+    log_target: true

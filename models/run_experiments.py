@@ -57,10 +57,11 @@ from models.unet.dataset import FEATURE_PRESETS, FIELD_NORMS, resolve_fields, co
 
 # Width presets for model capacity scaling
 WIDTH_PRESETS = {
-    'shallow':    32,
-    'normal':     64,
-    'wide':       96,
-    'extra_wide': 128,
+    'shallow':          32,
+    'normal':           64,
+    'wide':             96,
+    'extra_wide':       128,
+    'extra_extra_wide': 160,
 }
 
 
@@ -91,6 +92,14 @@ def build_cfg(base, experiment):
         from models.stack.train import DEFAULT_CONFIG as STACK_DEFAULTS
         for k, v in STACK_DEFAULTS.items():
             cfg.setdefault(k, v)
+    elif model_type == 'stack_3d':
+        from models.stack_3d.train import DEFAULT_CONFIG as STACK3D_DEFAULTS
+        for k, v in STACK3D_DEFAULTS.items():
+            cfg.setdefault(k, v)
+    elif model_type == 'unet_3d':
+        from models.unet_3d.train import DEFAULT_CONFIG as UNET3D_DEFAULTS
+        for k, v in UNET3D_DEFAULTS.items():
+            cfg.setdefault(k, v)
 
     # Apply base overrides
     field_map = {
@@ -105,6 +114,7 @@ def build_cfg(base, experiment):
         'patience': 'patience',
         'base_filters': 'base_filters',
         'loss': 'loss_type',
+        'under_weight': 'under_weight',
         'filter_mode': 'filter_mode',
         'sampler_type': 'sampler_type',
         'max_precip': 'max_precip',
@@ -116,8 +126,9 @@ def build_cfg(base, experiment):
 
     # Direct pass-through keys
     for key in ['fields', 'use_dem', 'use_mask', 'use_temporal_pos',
-                'log_target', 'no_sampler', 'exclude_stations', 'n_encoder_blocks',
-                'spatial_head']:
+                'use_feature_masks', 'log_target', 'no_sampler', 'exclude_stations',
+                'n_encoder_blocks', 'spatial_head', 'latent_dim', 'z_collapse', 'zarr_cache_mb',
+                'skip_ablation', 'seed']:
         if key in base:
             cfg[key] = base[key]
     # 'features' is a YAML alias for 'fields'
@@ -130,8 +141,9 @@ def build_cfg(base, experiment):
             cfg[cfg_key] = experiment[yaml_key]
 
     for key in ['fields', 'use_dem', 'use_mask', 'use_temporal_pos',
-                'log_target', 'no_sampler', 'exclude_stations', 'n_encoder_blocks',
-                'spatial_head']:
+                'use_feature_masks', 'log_target', 'no_sampler', 'exclude_stations',
+                'n_encoder_blocks', 'spatial_head', 'latent_dim', 'z_collapse', 'zarr_cache_mb',
+                'skip_ablation', 'seed']:
         if key in experiment:
             cfg[key] = experiment[key]
     if 'features' in experiment:
@@ -141,6 +153,7 @@ def build_cfg(base, experiment):
     cfg.setdefault('use_dem', True)
     cfg.setdefault('use_mask', True)
     cfg.setdefault('use_temporal_pos', True)
+    cfg.setdefault('use_feature_masks', False)
     cfg.setdefault('log_target', True)
     cfg.setdefault('no_sampler', False)
     cfg.setdefault('filter_mode', 'blunt')
@@ -191,22 +204,32 @@ def print_experiment_plan(base, experiments):
 
         # Compute channel count
         cfg = build_cfg(base, exp)
-        fields = resolve_fields(cfg.get('fields'))
-        n_ch = compute_n_input_channels(
-            fields, cfg.get('use_mask', True),
-            cfg.get('use_temporal_pos', True), cfg.get('use_dem', True)
-        )
+        if model_type in ('stack_3d', 'unet_3d'):
+            from models.stack_3d.dataset import resolve_fields as resolve_fields_3d
+            from models.stack_3d.dataset import compute_n_input_channels as n_ch_3d
+            fields = resolve_fields_3d(cfg.get('fields'))
+            n_ch = n_ch_3d(
+                fields, cfg.get('use_mask', True),
+                cfg.get('use_temporal_pos', True), cfg.get('use_dem', True),
+                cfg.get('use_feature_masks', False),
+            )
+        else:
+            fields = resolve_fields(cfg.get('fields'))
+            n_ch = compute_n_input_channels(
+                fields, cfg.get('use_mask', True),
+                cfg.get('use_temporal_pos', True), cfg.get('use_dem', True),
+                cfg.get('use_feature_masks', False),
+            )
 
         print(f"  {i:<4} {name:<30} {model_type:<7} {str(features):<20} {loss:<12} {notes_str:<15} ({n_ch}ch)")
 
     print(f"\n{'='*70}\n")
 
 
-def _run_unet_experiment(cfg, name):
-    """Run a single U-Net experiment (train + eval + ablation)."""
+def _run_unet_experiment(cfg, name, skip_ablation=False):
+    """Run a single U-Net experiment (train + eval, optionally + ablation)."""
     from models.unet.train import train
     from models.unet.evaluate import evaluate
-    from models.unet.ablation import run_ablation
 
     best_ckpt, run_dir = train(cfg, run_name=name)
 
@@ -219,13 +242,17 @@ def _run_unet_experiment(cfg, name):
         run_dir=run_dir,
     )
 
-    run_ablation(
-        checkpoint_path=best_ckpt,
-        checkpoint_dir=cfg['checkpoint_dir'],
-        pickle_path=cfg['pickle_path'],
-        dem_path=cfg['dem_path'],
-        run_dir=run_dir,
-    )
+    if skip_ablation:
+        print("  ⏭ Skipping ablation (skip_ablation enabled)")
+    else:
+        from models.unet.ablation import run_ablation
+        run_ablation(
+            checkpoint_path=best_ckpt,
+            checkpoint_dir=cfg['checkpoint_dir'],
+            pickle_path=cfg['pickle_path'],
+            dem_path=cfg['dem_path'],
+            run_dir=run_dir,
+        )
 
     return best_ckpt, run_dir, metrics
 
@@ -249,7 +276,45 @@ def _run_stack_experiment(cfg, name):
     return best_ckpt, run_dir, metrics
 
 
-def run_experiments(yaml_path, dry_run=False, only=None):
+def _run_stack_3d_experiment(cfg, name):
+    """Run a single 3D Stack CNN experiment (train + eval)."""
+    from models.stack_3d.train import train
+    from models.stack_3d.evaluate import evaluate
+
+    best_ckpt, run_dir = train(cfg, run_name=name)
+
+    metrics, run_dir = evaluate(
+        checkpoint_path=best_ckpt,
+        checkpoint_dir=cfg['checkpoint_dir'],
+        pickle_path=cfg['pickle_path'],
+        dem_path=cfg['dem_path'],
+        output_dir=cfg.get('output_dir', 'evaluation_figures/stack_3d_dualpol'),
+        run_dir=run_dir,
+    )
+
+    return best_ckpt, run_dir, metrics
+
+
+def _run_unet_3d_experiment(cfg, name):
+    """Run a single 3D U-Net experiment (train + eval)."""
+    from models.unet_3d.train import train
+    from models.unet_3d.evaluate import evaluate
+
+    best_ckpt, run_dir = train(cfg, run_name=name)
+
+    metrics, run_dir = evaluate(
+        checkpoint_path=best_ckpt,
+        checkpoint_dir=cfg['checkpoint_dir'],
+        pickle_path=cfg['pickle_path'],
+        dem_path=cfg['dem_path'],
+        output_dir=cfg.get('output_dir', 'evaluation_figures/unet_3d_dualpol'),
+        run_dir=run_dir,
+    )
+
+    return best_ckpt, run_dir, metrics
+
+
+def run_experiments(yaml_path, dry_run=False, only=None, skip_ablation=False):
     """Run all experiments defined in the YAML file."""
     base, experiments = load_experiment_config(yaml_path)
     print_experiment_plan(base, experiments)
@@ -279,6 +344,10 @@ def run_experiments(yaml_path, dry_run=False, only=None):
         if 'checkpoint_dir' not in experiment and 'checkpoint_dir' not in base:
             if model_type == 'stack':
                 cfg['checkpoint_dir'] = 'models/checkpoints/stack_dualpol/'
+            elif model_type == 'stack_3d':
+                cfg['checkpoint_dir'] = 'models/checkpoints/stack_3d_dualpol/'
+            elif model_type == 'unet_3d':
+                cfg['checkpoint_dir'] = 'models/checkpoints/unet_3d_dualpol/'
             else:
                 cfg['checkpoint_dir'] = 'models/checkpoints/unet_dualpol/'
 
@@ -291,8 +360,13 @@ def run_experiments(yaml_path, dry_run=False, only=None):
         try:
             if model_type == 'stack':
                 best_ckpt, run_dir, metrics = _run_stack_experiment(cfg, name)
+            elif model_type == 'stack_3d':
+                best_ckpt, run_dir, metrics = _run_stack_3d_experiment(cfg, name)
+            elif model_type == 'unet_3d':
+                best_ckpt, run_dir, metrics = _run_unet_3d_experiment(cfg, name)
             else:
-                best_ckpt, run_dir, metrics = _run_unet_experiment(cfg, name)
+                exp_skip_ablation = skip_ablation or cfg.get('skip_ablation', False)
+                best_ckpt, run_dir, metrics = _run_unet_experiment(cfg, name, skip_ablation=exp_skip_ablation)
 
             elapsed = time.time() - exp_start
             results_summary.append({
@@ -368,6 +442,9 @@ if __name__ == '__main__':
     parser.add_argument('--dry-run', action='store_true', help='Print plan without running')
     parser.add_argument('--only', nargs='+', default=None,
                         help='Only run experiments with these names')
+    parser.add_argument('--skip-ablation', action='store_true',
+                        help='Skip the per-experiment feature ablation (unet only) for faster sweeps')
     args = parser.parse_args()
 
-    run_experiments(args.config, dry_run=args.dry_run, only=args.only)
+    run_experiments(args.config, dry_run=args.dry_run, only=args.only,
+                    skip_ablation=args.skip_ablation)

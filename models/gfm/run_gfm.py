@@ -71,11 +71,12 @@ def run_eval(cfg: dict, checkpoint_path: str = None) -> dict:
     print("  STEP 2 — EVALUATION")
     print("=" * 60)
 
-    metrics = evaluate(
+    metrics, test_summary, run_dir = evaluate(
         checkpoint_path = checkpoint_path,
         checkpoint_dir  = cfg["checkpoint_dir"],
         pickle_path     = cfg["pickle_path"],
         output_dir      = cfg["output_dir"],
+        dem_norm        = cfg.get("dem_norm", "minmax"),
     )
     return metrics
 

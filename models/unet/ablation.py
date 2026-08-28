@@ -11,6 +11,7 @@ Run from the project root:
 
 import argparse
 import json
+import sys
 import numpy as np
 import torch
 from pathlib import Path
@@ -24,7 +25,7 @@ from models.unet.evaluate import find_checkpoint, load_model
 from models.unet.train import (
     filter_nan_radar, filter_biased_extremes,
     filter_bad_samples, filter_suspect_station_days,
-    filter_radar_unsupported,
+    filter_radar_unsupported, filter_gauge_dumps, filter_stations,
 )
 
 DEFAULT_PICKLE = 'dataset/outputs/radar_gauge_dataset_tr22_24_26_vl_23_25.pkl'
@@ -32,8 +33,48 @@ DEFAULT_DEM = 'dem/preserve_dem_10m_utm.tif'
 DEFAULT_CKPT_DIR = 'models/checkpoints/stack_dualpol'
 
 
-def build_feature_groups(fields, use_mask=True, use_temporal_pos=True, use_dem=True):
-    """Dynamically build feature group channel indices from a field list."""
+def _ensure_utf8_stdio():
+    """Avoid UnicodeEncodeError on Windows cp1252 consoles."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            try:
+                stream.reconfigure(encoding='utf-8', errors='replace')
+            except Exception:
+                pass
+
+
+def _write_ablation_results(results_path, lines):
+    """Write ablation section, replacing any previous ablation block."""
+    marker = '  ABLATION RESULTS'
+    content = ''
+    if results_path.exists():
+        try:
+            content = results_path.read_text(encoding='utf-8')
+        except UnicodeDecodeError:
+            # Older files may have been written in the platform default
+            # encoding (cp1252 on Windows), which stores '²' (from "R²") as
+            # byte 0xb2. cp1252 decodes every byte, preserving content; the
+            # whole file is rewritten as utf-8 below, normalizing the encoding.
+            content = results_path.read_text(encoding='cp1252')
+        idx = content.find(marker)
+        if idx != -1:
+            block_start = content.rfind('=' * 60, 0, idx)
+            content = content[:block_start].rstrip() + '\n' if block_start != -1 else content[:idx].rstrip() + '\n'
+
+    # Always rewrite the entire file as utf-8 (not append) so a prior eval
+    # block written in cp1252 can't leave the file in a mixed encoding.
+    if content and not content.endswith('\n'):
+        content += '\n'
+    results_path.write_text(content + '\n'.join(lines) + '\n', encoding='utf-8')
+
+
+def build_feature_groups(fields, use_mask=True, use_temporal_pos=True, use_dem=True,
+                         use_feature_masks=False):
+    """Dynamically build feature group channel indices from a field list.
+
+    Channel layout must match RadarGaugeDataset.__getitem__:
+    fields → mask → feature_masks → temporal_pos → dem.
+    """
     groups = {}
     n_fields = len(fields)
 
@@ -63,11 +104,16 @@ def build_feature_groups(fields, use_mask=True, use_temporal_pos=True, use_dem=T
     if vert_channels:
         groups['all_vertical'] = vert_channels
 
-    # Auxiliary channels (after field channels)
+    # Auxiliary channels (after field channels) — order matches the dataset.
     offset = n_fields * N_SCANS
     if use_mask:
         groups['mask'] = list(range(offset, offset + N_SCANS))
         offset += N_SCANS
+    if use_feature_masks:
+        from models.unet.dataset import FEATURE_MASK_SOURCES
+        feat_mask_channels = list(range(offset, offset + len(FEATURE_MASK_SOURCES) * N_SCANS))
+        groups['feature_masks'] = feat_mask_channels
+        offset += len(FEATURE_MASK_SOURCES) * N_SCANS
     if use_temporal_pos:
         groups['temporal_pos'] = list(range(offset, offset + N_SCANS))
         offset += N_SCANS
@@ -152,6 +198,7 @@ def compute_metrics(preds_mm, targets_mm):
 
 
 def run_ablation(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, dem_path=None, run_dir=None):
+    _ensure_utf8_stdio()
     pickle_path = pickle_path or DEFAULT_PICKLE
     dem_path = dem_path or DEFAULT_DEM
 
@@ -165,11 +212,17 @@ def run_ablation(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, de
 
     model, cfg = load_model(ckpt, device)
 
+    # Prefer paths from checkpoint config for reproducibility
+    pickle_path = cfg.get('pickle_path') or pickle_path
+    dem_path = cfg.get('dem_path') or dem_path
+    exclude = cfg.get('exclude_stations', [])
+
     # Reconstruct dataset with same feature config as training
     fields = resolve_fields(cfg.get('fields'))
     use_dem = cfg.get('use_dem', True)
     use_mask = cfg.get('use_mask', True)
     use_temporal_pos = cfg.get('use_temporal_pos', True)
+    use_feature_masks = cfg.get('use_feature_masks', False)
 
     ds_kwargs = dict(
         dem_path=dem_path,
@@ -178,8 +231,10 @@ def run_ablation(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, de
         use_mask=use_mask,
         use_temporal_pos=use_temporal_pos,
         log_target=cfg.get('log_target', True),
+        use_feature_masks=use_feature_masks,
     )
     val_ds = RadarGaugeDataset(pickle_path, split='val', augment=False, **ds_kwargs)
+    val_ds.samples = filter_stations(val_ds.samples, exclude)
     val_ds.samples = filter_nan_radar(val_ds.samples)
     filter_mode = cfg.get('filter_mode', 'blunt')
     if filter_mode == 'radar':
@@ -188,10 +243,13 @@ def run_ablation(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, de
         val_ds.samples = filter_biased_extremes(val_ds.samples)
         val_ds.samples = filter_bad_samples(val_ds.samples)
     val_ds.samples = filter_suspect_station_days(val_ds.samples)
+    val_ds.samples = filter_gauge_dumps(val_ds.samples)
 
     # Build dynamic feature groups for this model's configuration
-    feature_groups = build_feature_groups(fields, use_mask, use_temporal_pos, use_dem)
-    n_channels = compute_n_input_channels(fields, use_mask, use_temporal_pos, use_dem)
+    feature_groups = build_feature_groups(fields, use_mask, use_temporal_pos, use_dem,
+                                           use_feature_masks)
+    n_channels = compute_n_input_channels(fields, use_mask, use_temporal_pos, use_dem,
+                                          use_feature_masks)
 
     print(f"\nAblation dataset: {len(val_ds.samples)} validation samples")
     val_loader = DataLoader(val_ds, batch_size=64, shuffle=False, num_workers=0, pin_memory=True)
@@ -271,7 +329,7 @@ def run_ablation(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, de
     print(f"  - Impact: HIGH (ΔR² < -0.02), MEDIUM (-0.02 to -0.005), LOW (±0.005), NEGATIVE (> +0.005)")
     print(f"\n{'='*70}\n")
 
-    # Write ablation results to results.txt (append)
+    # Write ablation results to results.txt (replace prior ablation block)
     if run_dir:
         results_path = Path(run_dir) / 'results.txt'
         lines = []
@@ -298,9 +356,8 @@ def run_ablation(checkpoint_path=None, checkpoint_dir=None, pickle_path=None, de
         lines.append("  - Positive dR2 = feature HURTS (removing it improves performance)")
         lines.append("")
 
-        with open(results_path, 'a') as f:
-            f.write('\n'.join(lines) + '\n')
-        print(f"  ✓ Appended ablation results to: {results_path}")
+        _write_ablation_results(results_path, lines)
+        print(f"  OK: Wrote ablation results to: {results_path}")
 
     return results
 

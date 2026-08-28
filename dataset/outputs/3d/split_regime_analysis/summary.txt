@@ -1,0 +1,9 @@
+Pickle: dataset\outputs\3d\radar_gauge_dataset_subml_9500.pkl
+Train years: [2022, 2024, 2026]
+Val years: [2023, 2025]
+Filtered: True
+Train n: 20547
+Val n: 9791
+Val - Train warm_shallow_heavy: -0.1pp
+Val - Train bright_band: +1.4pp
+Val - Train heavy (>5mm): -0.6pp

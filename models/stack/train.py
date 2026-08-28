@@ -20,7 +20,7 @@ from tqdm import tqdm
 
 from models.stack.model import PrecipitationStackModel, init_weights
 from models.unet.dataset import RadarGaugeDataset, resolve_fields, compute_n_input_channels
-from models.unet.train import filter_radar_unsupported
+from models.unet.train import filter_radar_unsupported, set_seed
 
 # ── DEFAULT CONFIG ────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = {
@@ -45,10 +45,11 @@ DEFAULT_CONFIG = {
 class GaugePixelLoss(nn.Module):
     """Loss computed only at the gauge pixel location."""
 
-    def __init__(self, max_precip=100.0, loss_type='mae'):
+    def __init__(self, max_precip=100.0, loss_type='mae', under_weight=2.0):
         super().__init__()
         self.max_precip = max_precip
         self.loss_type = loss_type
+        self.under_weight = under_weight
 
     def forward(self, pred_map, target, gauge_pixel):
         batch_size = pred_map.shape[0]
@@ -90,6 +91,23 @@ class GaugePixelLoss(nn.Module):
         elif self.loss_type == 'weighted_mae_sq':
             weights = 1.0 + tgt_v ** 2
             return (weights * torch.abs(pred_v - tgt_v)).mean()
+        elif self.loss_type == 'asym_mae':
+            # Penalise underprediction (pred < target) more heavily than overprediction.
+            residual = pred_v - tgt_v
+            w = torch.where(residual < 0,
+                            torch.full_like(residual, self.under_weight),
+                            torch.ones_like(residual))
+            return (w * torch.abs(residual)).mean()
+        elif self.loss_type == 'asym_huber':
+            residual = pred_v - tgt_v
+            delta = 1.0
+            huber = torch.where(torch.abs(residual) <= delta,
+                                0.5 * residual ** 2,
+                                delta * (torch.abs(residual) - 0.5 * delta))
+            w = torch.where(residual < 0,
+                            torch.full_like(huber, self.under_weight),
+                            torch.ones_like(huber))
+            return (w * huber).mean()
         return torch.abs(pred_v - tgt_v).mean()
 
 
@@ -403,6 +421,8 @@ def save_config(run_dir, cfg, n_params, train_samples, val_samples, model):
 
     config_data = {
         'timestamp': datetime.now().isoformat(),
+        'model_type': 'stack',
+        'seed': cfg.get('seed'),
         'loss_type': cfg.get('loss_type', 'mae'),
         'lr': cfg.get('lr'),
         'weight_decay': cfg.get('weight_decay'),
@@ -417,11 +437,13 @@ def save_config(run_dir, cfg, n_params, train_samples, val_samples, model):
         'use_dem': cfg.get('use_dem', True),
         'use_mask': cfg.get('use_mask', True),
         'use_temporal_pos': cfg.get('use_temporal_pos', True),
+        'use_feature_masks': cfg.get('use_feature_masks', False),
         'log_target': cfg.get('log_target', True),
         'n_parameters': n_params,
         'n_input_channels': compute_n_input_channels(
             fields, cfg.get('use_mask', True),
-            cfg.get('use_temporal_pos', True), cfg.get('use_dem', True)
+            cfg.get('use_temporal_pos', True), cfg.get('use_dem', True),
+            cfg.get('use_feature_masks', False)
         ),
         'n_encoder_blocks': cfg.get('n_encoder_blocks', 3),
         'spatial_head': cfg.get('spatial_head', False),
@@ -443,6 +465,9 @@ def save_config(run_dir, cfg, n_params, train_samples, val_samples, model):
 
 def train(cfg: dict = None, run_name: str = None):
     cfg = cfg or dict(DEFAULT_CONFIG)
+    seed = cfg.get('seed')
+    if seed is not None:
+        set_seed(int(seed))
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     run_dir = create_run_dir(cfg['checkpoint_dir'], run_name)
@@ -452,10 +477,10 @@ def train(cfg: dict = None, run_name: str = None):
     print(f"  Device:  {device}")
     print(f"  Dataset: {cfg['pickle_path']}")
     print(f"  Epochs:  {cfg['max_epochs']}")
+    print(f"  Seed:    {seed if seed is not None else 'unseeded (random)'}")
     print(f"  Run dir: {run_dir}")
     print(f"{'='*60}\n")
 
-    # Data
     # Data
     ds_kwargs = dict(
         dem_path=cfg['dem_path'],
@@ -464,6 +489,7 @@ def train(cfg: dict = None, run_name: str = None):
         use_mask=cfg.get('use_mask', True),
         use_temporal_pos=cfg.get('use_temporal_pos', True),
         log_target=cfg.get('log_target', True),
+        use_feature_masks=cfg.get('use_feature_masks', False),
     )
     train_ds = RadarGaugeDataset(cfg['pickle_path'], split='train', augment=True, aug_prob=0.5, **ds_kwargs)
     val_ds = RadarGaugeDataset(cfg['pickle_path'], split='val', augment=False, **ds_kwargs)
@@ -540,7 +566,8 @@ def train(cfg: dict = None, run_name: str = None):
 
     save_config(run_dir, cfg, n_params, len(train_ds.samples), len(val_ds.samples), model)
 
-    criterion = GaugePixelLoss(max_precip=cfg['max_precip'], loss_type=cfg['loss_type'])
+    criterion = GaugePixelLoss(max_precip=cfg['max_precip'], loss_type=cfg['loss_type'],
+                               under_weight=cfg.get('under_weight', 2.0))
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 

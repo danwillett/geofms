@@ -1,0 +1,54 @@
+# 3D U-Net experiments
+# Run with: python -m models.run_experiments models/unet_3d/experiments.yaml
+# Dry run:  python -m models.run_experiments models/unet_3d/experiments.yaml --dry-run
+
+base:
+  model_type: unet_3d
+  pickle: dataset/outputs/3d/radar_gauge_dataset_3d_9500_temporal.pkl
+  dem: dem/preserve_dem_10m_utm.tif
+  patience: 15
+  epochs: 100
+  batch_size: 8
+  lr: 5.0e-5
+  base_filters: 64
+  no_sampler: true
+  filter_mode: blunt
+  features: dualpol
+  loss: asym_mae
+  under_weight: 2.0
+  log_target: true
+
+experiments:
+  - name: unet3d_asymmae_nolog_uw2_dualpol_temporal
+    loss: asym_mae
+    notes: 3D U-Net on matched temporal split (2022/2024/2026 train, 2023/2025 val)
+    log_target: false
+
+  # - name: unet3d_mae_nolog_uw2_dualpol_temporal
+  #   loss: mae
+  #   log_target: false
+  #   notes: 3D U-Net on matched temporal split (2022/2024/2026 train, 2023/2025 val)
+  
+  - name: unet3d_mae_nolog_heavy_uw2_dualpol_temporal
+    loss: mae
+    log_target: false
+    notes: 3D U-Net on matched temporal split (2022/2024/2026 train, 2023/2025 val)
+    no_sampler: false
+    sampler_type: heavy
+
+  - name: unet3d_asymmae_log_uw2_dualpol_temporal
+    loss: asym_mae
+    notes: 3D U-Net on matched temporal split (2022/2024/2026 train, 2023/2025 val)
+    log_target: true
+
+  - name: unet3d_mae_log_uw2_dualpol_temporal
+    loss: mae
+    log_target: true
+    notes: 3D U-Net on matched temporal split (2022/2024/2026 train, 2023/2025 val)
+
+  - name: unet3d_mae_log_heavy_uw2_dualpol_temporal
+    loss: mae
+    log_target: true
+    notes: 3D U-Net on matched temporal split (2022/2024/2026 train, 2023/2025 val)
+    no_sampler: false
+    sampler_type: heavy

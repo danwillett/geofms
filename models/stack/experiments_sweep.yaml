@@ -1,0 +1,133 @@
+# Stack CNN sweep on the daygroup+offsets pickle.
+# One axis varied per experiment from a fixed baseline.
+# Goal: find the best conditions for the stack before running seeded replicates.
+#
+# Baseline: normal width (latent_dim=512), asym_mae uw2, no sampler,
+#           raw mm-space, spatial_head=false, n_encoder_blocks=3
+#
+# Stack-specific notes:
+#   - 'width' here sets latent_dim (the stack's capacity knob), NOT base_filters
+#   - spatial_head=true preserves spatial structure through a 2D conv head
+#     (vs. false = global-avg-pool -> MLP -> upsample to spatial output)
+#   - n_encoder_blocks controls depth (2=shallow, 3=default, 4=deep)
+#
+# Run with:
+#   python -m models.run_experiments models/stack/experiments_sweep.yaml --skip-ablation
+# Preview:
+#   python -m models.run_experiments models/stack/experiments_sweep.yaml --dry-run
+
+base:
+  model_type: stack
+  pickle: dataset/outputs/3d/radar_gauge_dataset_subml_daygroup_offsets_9500.pkl
+  dem: dem/preserve_dem_10m_utm.tif
+  patience: 15
+  epochs: 100
+  batch_size: 32
+  lr: 5.0e-5
+  filter_mode: blunt
+  use_dem: true
+  use_feature_masks: true
+  log_target: false
+  loss: asym_mae
+  under_weight: 2.0
+  no_sampler: true
+  spatial_head: false
+  n_encoder_blocks: 3
+  features:
+    - reflectivity
+    - echo_top_height
+    - max_z_height
+    - vil
+    - column_depth_fraction
+    - vertical_reflectivity_gradient
+    - melting_layer_height
+    - rhohv_min
+    - bright_band_ref
+    - bright_band_drop
+    - maxz_meltlayer_offset
+    - bright_band_intensity
+    - subml_rhohv
+    - subml_zdr
+    - subml_kdp
+    - subml_ref_max
+    - subml_zdr_gradient
+
+experiments:
+  # ── BASELINE ────────────────────────────────────────────────
+  # - name: baseline
+  #   model_type: stack
+
+  # ── LATENT DIM / WIDTH (hold all else fixed) ────────────────
+  # Stack width is latent_dim (encoder output), NOT base_filters
+  - name: latent_256
+    model_type: stack
+    latent_dim: 256
+
+  - name: latent_1024
+    model_type: stack
+    latent_dim: 1024
+
+  - name: latent_2048
+    model_type: stack
+    latent_dim: 2048
+
+  # ── ENCODER DEPTH ───────────────────────────────────────────
+  - name: depth_2blocks
+    model_type: stack
+    n_encoder_blocks: 2
+
+  - name: depth_4blocks
+    model_type: stack
+    n_encoder_blocks: 4
+
+  # ── SPATIAL HEAD (preserves 2D structure in output) ─────────
+  - name: spatial_head
+    model_type: stack
+    spatial_head: true
+
+  - name: spatial_head_wide
+    model_type: stack
+    spatial_head: true
+    latent_dim: 1024
+
+  # ── SAMPLER (hold baseline config) ──────────────────────────
+  - name: sampler_light
+    model_type: stack
+    no_sampler: false
+    sampler_type: light
+
+  - name: sampler_moderate
+    model_type: stack
+    no_sampler: false
+    sampler_type: moderate
+
+  - name: sampler_heavy
+    model_type: stack
+    no_sampler: false
+    sampler_type: heavy
+
+  # ── LOSS TYPE ───────────────────────────────────────────────
+  - name: loss_mae
+    model_type: stack
+    loss: mae
+
+  - name: loss_weighted_mae
+    model_type: stack
+    loss: weighted_mae
+
+  - name: loss_asym_huber_uw2
+    model_type: stack
+    loss: asym_huber
+
+  - name: loss_asymmae_uw1p5
+    model_type: stack
+    under_weight: 1.5
+
+  - name: loss_asymmae_uw2p5
+    model_type: stack
+    under_weight: 2.5
+
+  # ── TARGET SPACE ────────────────────────────────────────────
+  - name: logspace_asymmae_uw2
+    model_type: stack
+    log_target: true

@@ -1,0 +1,76 @@
+# TerraMind / GFM ablation — does the PRETRAINED DEM channel actually help?
+#
+# In this pipeline only two things can carry TerraMind's pretraining: the ViT
+# encoder weights and the DEM patch-embedding (RADAR is always a from-scratch
+# modality — TerraMind never saw radar). This sweep isolates the value of the
+# pretrained DEM weights, with everything else held fixed.
+#
+# Prerequisite baked in: dem_norm controls how DEM is fed to the model.
+#   terramind — standardize to TerraMind's pretrained DEM stats
+#               (dem_m - 670.665) / 951.272. REQUIRED for the pretrained DEM
+#               embedding to see in-distribution input.
+#   minmax    — old local [0,1] scaling (DEM is out-of-distribution for the
+#               pretrained embedding).
+#
+# Ablation (all output_size 19 = full 9.5 km context, mse loss + heavy-rain
+# sampler — the combo that gave the best validation R² in prior GFM runs;
+# 3 seeds each):
+#   tm_pre_demPre         pretrained backbone + pretrained DEM  (full transfer)
+#   tm_pre_demRand        pretrained backbone + RANDOM DEM      (kills pretrained DEM weights)
+#       → (tm_pre_demPre − tm_pre_demRand) = value of the pretrained DEM weights
+#   tm_scratch            random backbone + random DEM          (same tiny arch, no pretraining)
+#       → (tm_pre_* − tm_scratch) = value of all pretraining at fixed capacity
+#   tm_pre_demPre_minmax  pretrained + pretrained DEM, but WRONG norm
+#       → (tm_pre_demPre − tm_pre_demPre_minmax) = does correct DEM norm unlock the pretrained DEM?
+#
+# Run with:
+#   python -m models.gfm.run_experiments models/gfm/experiments.yaml
+#   python -m models.gfm.run_experiments models/gfm/experiments.yaml --dry-run
+#
+# Each run writes a timestamped dir under checkpoint_dir with config.json
+# (now incl. val_metrics + test_metrics), checkpoints, and evaluation figures.
+# The sweep summary is written to experiment_summary_<timestamp>.json.
+
+base:
+  pickle: dataset/outputs/3d/radar_gauge_dataset_subml_daygroup_offsets_9500.pkl
+  dem: dem/preserve_dem_10m_utm.tif
+  checkpoint_dir: models/checkpoints/terramind_dem_ablation/
+  epochs: 100
+  batch_size: 8
+  patience: 15
+  lr: 1.0e-5
+  output_size: 19
+  output_bias: 3.0
+  log_target: true
+  loss: mse              # best val R² in prior GFM runs (with the heavy sampler)
+  no_sampler: false      # keep the heavy-rain weighted sampler ON
+  filter_mode: blunt
+  use_feature_masks: true
+  use_wandb: false
+  # Three seeds per config to separate true effects from seed noise.
+  seeds: [42, 43, 44]
+
+experiments:
+
+  # ── Full transfer: pretrained backbone + pretrained DEM, correctly normalized
+  - name: tm_pre_demPre
+    backbone_pretrained: true
+    dem_init: pretrained
+    dem_norm: terramind
+
+  # ── Isolate the pretrained DEM weights: same backbone, random DEM embedding
+  - name: tm_pre_demRand
+    backbone_pretrained: true
+    dem_init: random
+    dem_norm: terramind
+
+  # ── Capacity control: same tiny architecture, NO pretraining at all
+  - name: tm_scratch
+    backbone_pretrained: false
+    dem_norm: terramind
+
+  # ── DEM-norm A/B: pretrained DEM but fed the OLD minmax (out-of-distribution)
+  - name: tm_pre_demPre_minmax
+    backbone_pretrained: true
+    dem_init: pretrained
+    dem_norm: minmax

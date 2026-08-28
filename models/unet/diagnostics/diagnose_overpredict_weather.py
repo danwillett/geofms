@@ -7,7 +7,7 @@ If overpredictions correlate with low RH and high temperature, it suggests
 rain is evaporating before reaching the gauge (virga).
 
 Run from project root:
-    python -m models.unet.diagnose_overpredict_weather --run-dir models/checkpoints/unet_dualpol/<run_name>
+    python -m models.unet.diagnostics.diagnose_overpredict_weather --run-dir models/checkpoints/unet_dualpol/<run_name>
 """
 
 import argparse
@@ -99,6 +99,7 @@ def run_weather_correlation(run_dir, pred_threshold=8.0, actual_threshold=5.0):
         use_dem=cfg.get('use_dem', True),
         use_mask=cfg.get('use_mask', True),
         use_temporal_pos=cfg.get('use_temporal_pos', True),
+        use_feature_masks=cfg.get('use_feature_masks', False),
         log_target=log_target,
     )
 
@@ -479,6 +480,67 @@ def run_weather_correlation(run_dir, pred_threshold=8.0, actual_threshold=5.0):
                 print(f"    → Positive: unexpected direction")
             else:
                 print(f"    → Weak correlation")
+
+        # ── Direct bright-band features (now model inputs): rhohv_min is the
+        # column-minimum RhoHV (the melting-layer decorrelation itself) and
+        # melting_layer_height is its altitude. Unlike the proxy above (RhoHV
+        # at max-Z), these directly measure the bright band. If overpredictions
+        # still show low rhohv_min / low melting_layer_height, the model has the
+        # signal as an input but isn't using it to discount reflectivity.
+        direct_idx = {f: PICKLE_FIELD_ORDER.index(f)
+                      for f in ['rhohv_min', 'melting_layer_height']
+                      if f in PICKLE_FIELD_ORDER}
+        if direct_idx:
+            rmin_vals, mlh_vals = {}, {}
+            for orig_i, row in samples_df.iterrows():
+                j = sample_lookup.get((row['station'], row['hour']))
+                if j is None:
+                    continue
+                rp = val_ds.samples[j]['radar_patch']
+                cy, cx = rp.shape[2] // 2, rp.shape[3] // 2
+                for fname, store in (('rhohv_min', rmin_vals),
+                                     ('melting_layer_height', mlh_vals)):
+                    idx = direct_idx.get(fname)
+                    if idx is None or idx >= rp.shape[1]:
+                        continue
+                    v = rp[:, idx, cy, cx]
+                    v = v[(v != -9999.0) & ~np.isnan(v)]
+                    if len(v) > 0:
+                        store[orig_i] = float(np.nanmean(v))
+
+            samples_df['rhohv_min'] = samples_df.index.map(rmin_vals)
+            samples_df['melting_layer_height'] = samples_df.index.map(mlh_vals)
+
+            print(f"\n  Direct bright-band features (rhohv_min + melting_layer_height at gauge pixel):")
+            rm = samples_df['rhohv_min']
+            o_rm, c_rm = rm[over_i].dropna(), rm[correct_i].dropna()
+            if len(o_rm) and len(c_rm):
+                print(f"  {'Metric':<22} {'Overpredictions':>15} {'Correct preds':>15} {'Difference':>12}")
+                print(f"  {'-'*22} {'-'*15} {'-'*15} {'-'*12}")
+                print(f"  {'Mean rhohv_min':<22} {o_rm.mean():>15.4f} {c_rm.mean():>15.4f} {o_rm.mean()-c_rm.mean():>+12.4f}")
+                print(f"  {'Median rhohv_min':<22} {o_rm.median():>15.4f} {c_rm.median():>15.4f} {o_rm.median()-c_rm.median():>+12.4f}")
+                print(f"  {'% rhohv_min < 0.95':<22} {100*(o_rm<0.95).mean():>14.1f}% {100*(c_rm<0.95).mean():>14.1f}%")
+                print(f"  {'N samples':<22} {len(o_rm):>15} {len(c_rm):>15}")
+
+            mlh = samples_df['melting_layer_height']
+            o_mlh, c_mlh = mlh[over_i].dropna(), mlh[correct_i].dropna()
+            if len(o_mlh) and len(c_mlh):
+                print(f"\n  {'Metric':<22} {'Overpredictions':>15} {'Correct preds':>15} {'Difference':>12}")
+                print(f"  {'-'*22} {'-'*15} {'-'*15} {'-'*12}")
+                print(f"  {'Mean ML height (m)':<22} {o_mlh.mean():>15.0f} {c_mlh.mean():>15.0f} {o_mlh.mean()-c_mlh.mean():>+12.0f}")
+                print(f"  {'Median ML height (m)':<22} {o_mlh.median():>15.0f} {c_mlh.median():>15.0f} {o_mlh.median()-c_mlh.median():>+12.0f}")
+                print(f"  {'N samples':<22} {len(o_mlh):>15} {len(c_mlh):>15}")
+
+            corr_rm = samples_df[['rhohv_min', 'residual']].dropna()
+            if len(corr_rm) > 10:
+                r = corr_rm['rhohv_min'].corr(corr_rm['residual'])
+                print(f"\n  Correlation (rhohv_min vs. residual): r = {r:.3f}")
+                if r < -0.15:
+                    print(f"    → Negative: lower rhohv_min (melting layer) = more overprediction (bright band)")
+                elif r > 0.15:
+                    print(f"    → Positive: unexpected direction")
+                else:
+                    print(f"    → Weak correlation")
 
     # Generate plots
     output_dir = Path(run_dir) if run_dir else Path('evaluation_figures/unet_dualpol')
